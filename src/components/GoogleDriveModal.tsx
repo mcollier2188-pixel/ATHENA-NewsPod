@@ -43,6 +43,14 @@ interface GoogleDriveModalProps {
   briefing: AudioBriefing | null;
   onBuildStitchedWavBlob: () => Blob | null;
   onImportFilesToSources: (files: File[]) => Promise<boolean>;
+  onImportDriveItems?: (
+    items: Array<{ file: File; driveItem: DriveFileItem }>
+  ) => Promise<boolean>;
+  onExportedBriefingAsset?: (payload: {
+    briefingId: string;
+    kind: 'doc' | 'wav';
+    driveItem: DriveFileItem;
+  }) => void;
   onClose: () => void;
 }
 
@@ -78,6 +86,8 @@ export function GoogleDriveModal({
   briefing,
   onBuildStitchedWavBlob,
   onImportFilesToSources,
+  onImportDriveItems,
+  onExportedBriefingAsset,
   onClose,
 }: GoogleDriveModalProps) {
   const {
@@ -238,13 +248,15 @@ export function GoogleDriveModal({
     );
 
     try {
-      const browserFiles: File[] = [];
+      const downloadedItems: Array<{ file: File; driveItem: DriveFileItem }> = [];
       for (const item of selectedImportableFiles) {
         const downloaded = await downloadDriveFileAsBrowserFile(driveAccessToken, item);
-        browserFiles.push(downloaded);
+        downloadedItems.push({ file: downloaded, driveItem: item });
       }
       setStatusMessage('Indexing Drive documents into Notebook Sources...');
-      const ok = await onImportFilesToSources(browserFiles);
+      const ok = onImportDriveItems
+        ? await onImportDriveItems(downloadedItems)
+        : await onImportFilesToSources(downloadedItems.map((d) => d.file));
       if (ok) {
         setSelectedIds(new Set());
         onClose();
@@ -308,10 +320,15 @@ export function GoogleDriveModal({
       });
 
       setLastSavedDriveItem(saved);
+      onExportedBriefingAsset?.({
+        briefingId: briefing.id,
+        kind: 'doc',
+        driveItem: saved,
+      });
       setStatusMessage(
         confirmedOverwriteFileId
           ? `Updated "${saved.name}" in Google Drive.`
-          : `Saved "${saved.name}" as a Google Doc in Drive.`
+          : `Saved "${saved.name}" as a formatted Google Doc in Drive.`
       );
       await loadFiles(driveAccessToken);
     } catch (err) {
@@ -363,6 +380,11 @@ export function GoogleDriveModal({
       });
 
       setLastSavedDriveItem(saved);
+      onExportedBriefingAsset?.({
+        briefingId: briefing.id,
+        kind: 'wav',
+        driveItem: saved,
+      });
       setStatusMessage(
         confirmedOverwriteFileId
           ? `Overwrote audio file "${saved.name}" in Google Drive.`
@@ -638,10 +660,11 @@ export function GoogleDriveModal({
                   </button>
                 </form>
 
-                <div className="inline-flex items-center gap-1 p-1 bg-[#0E1116] border border-[#222833] rounded-md self-start">
+                <div className="inline-flex items-center gap-1 p-1 bg-[#0E1116] border border-[#222833] rounded-md self-start overflow-x-auto max-w-full">
                   {(
                     [
-                      { id: 'importable', label: 'Docs & PDFs' },
+                      { id: 'importable', label: 'All Docs & PDFs' },
+                      { id: 'docs', label: 'Google Docs' },
                       { id: 'audio', label: 'Audio' },
                       { id: 'folders', label: 'Folders' },
                       { id: 'all', label: 'All' },

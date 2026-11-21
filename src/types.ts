@@ -64,6 +64,9 @@ export interface NewsArticle {
   shelvedAt?: string;
   addedAt: string;
   imageUrl?: string;
+  driveFileId?: string;
+  driveWebViewLink?: string;
+  driveMimeType?: string;
 }
 
 export interface BriefingPreferences {
@@ -109,6 +112,11 @@ export interface AudioBriefing {
   preferences: BriefingPreferences;
   articleTitles: string[];
   segments: BriefingSegment[];
+  exportedDocId?: string;
+  exportedDocUrl?: string;
+  exportedWavFileId?: string;
+  exportedWavUrl?: string;
+  syncedTaskCount?: number;
 }
 
 export interface ChatMessage {
@@ -444,3 +452,22 @@ export interface CreateMockupShareResult {
   ttlHours: ShareTtlHours;
   manageToken?: string;
 }
+
+export type WorkspaceLinkKind =
+  | 'drive_source'
+  | 'google_doc_export'
+  | 'drive_wav_export'
+  | 'google_task';
+
+export interface WorkspaceLinkItem {
+  linkId: string;
+  ownerId: string;
+  kind: WorkspaceLinkKind;
+  externalId: string;
+  title: string;
+  url: string;
+  sourceId?: string;
+  briefingId?: string;
+  createdAtIso: string;
+}
+

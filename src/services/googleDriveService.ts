@@ -1,6 +1,6 @@
 import type { AudioBriefing } from '../types';
 
-export type DriveFileFilter = 'importable' | 'audio' | 'folders' | 'all';
+export type DriveFileFilter = 'importable' | 'docs' | 'audio' | 'folders' | 'all';
 
 export interface DriveFileItem {
   id: string;
@@ -24,7 +24,9 @@ export interface DriveActivityItem {
 }
 
 export class DriveAuthExpiredError extends Error {
-  constructor(message = 'Your Google Drive session expired or needs permission. Please sign in with Google again.') {
+  constructor(
+    message = 'Your Google Workspace session expired or needs permission. Please sign in with Google again.'
+  ) {
     super(message);
     this.name = 'DriveAuthExpiredError';
   }
@@ -33,6 +35,7 @@ export class DriveAuthExpiredError extends Error {
 const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD_BASE = 'https://www.googleapis.com/upload/drive/v3';
 const DRIVE_ACTIVITY_URL = 'https://driveactivity.googleapis.com/v2/activity:query';
+const DOCS_API_BASE = 'https://docs.googleapis.com/v1/documents';
 
 export const IMPORTABLE_DRIVE_MIME_TYPES = new Set([
   'application/vnd.google-apps.document',
@@ -101,7 +104,7 @@ function escapeDriveQueryLiteral(raw: string): string {
   return raw.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
-async function parseDriveError(res: Response): Promise<never> {
+async function parseWorkspaceError(res: Response, serviceLabel = 'Google Drive'): Promise<never> {
   let detail = '';
   try {
     const json = (await res.json()) as {
@@ -114,20 +117,21 @@ async function parseDriveError(res: Response): Promise<never> {
 
   if (res.status === 401) {
     throw new DriveAuthExpiredError(
-      'Your Google Drive access token expired. Sign in with Google to reconnect.'
+      `Your ${serviceLabel} access token expired. Sign in with Google to reconnect.`
     );
   }
   if (
     res.status === 403 &&
     (detail.toLowerCase().includes('insufficient') ||
       detail.toLowerCase().includes('scope') ||
-      detail.toLowerCase().includes('credential'))
+      detail.toLowerCase().includes('credential') ||
+      detail.toLowerCase().includes('permission'))
   ) {
     throw new DriveAuthExpiredError(
-      'Additional Google Drive permission is required. Sign in with Google to grant access.'
+      `Additional ${serviceLabel} permission is required. Sign in with Google to grant access.`
     );
   }
-  throw new Error(detail || `Google Drive request failed (HTTP ${res.status}).`);
+  throw new Error(detail || `${serviceLabel} request failed (HTTP ${res.status}).`);
 }
 
 export async function listDriveFiles(params: {
@@ -158,7 +162,7 @@ export async function listDriveFiles(params: {
 
   if (filter === 'importable') {
     clauses.push(
-      "(" +
+      '(' +
         [
           "mimeType = 'application/vnd.google-apps.document'",
           "mimeType = 'application/vnd.google-apps.presentation'",
@@ -169,7 +173,11 @@ export async function listDriveFiles(params: {
           "mimeType = 'text/markdown'",
           "mimeType = 'application/vnd.google-apps.folder'",
         ].join(' or ') +
-        ")"
+        ')'
+    );
+  } else if (filter === 'docs') {
+    clauses.push(
+      "(mimeType = 'application/vnd.google-apps.document' or mimeType = 'application/vnd.google-apps.folder')"
     );
   } else if (filter === 'audio') {
     clauses.push(
@@ -197,7 +205,7 @@ export async function listDriveFiles(params: {
   });
 
   if (!res.ok) {
-    await parseDriveError(res);
+    await parseWorkspaceError(res, 'Google Drive');
   }
 
   const data = (await res.json()) as { files?: DriveFileItem[] };
@@ -221,7 +229,6 @@ export async function fetchRecentDriveActivity(
     throw new DriveAuthExpiredError();
   }
   if (!res.ok) {
-    // Gracefully return empty list if Drive Activity API is not yet enabled on the Cloud project
     return [];
   }
 
@@ -273,17 +280,129 @@ export async function fetchRecentDriveActivity(
   return items;
 }
 
+interface GoogleDocParagraphElement {
+  textRun?: { content?: string };
+}
+
+interface GoogleDocStructuralElement {
+  endIndex?: number;
+  paragraph?: {
+    elements?: GoogleDocParagraphElement[];
+    paragraphStyle?: { namedStyleType?: string };
+    bullet?: { listId?: string; nestingLevel?: number };
+  };
+  table?: {
+    tableRows?: Array<{
+      tableCells?: Array<{
+        content?: GoogleDocStructuralElement[];
+      }>;
+    }>;
+  };
+}
+
+function extractTextFromStructuralElements(
+  elements: GoogleDocStructuralElement[] | undefined
+): string {
+  if (!elements || elements.length === 0) return '';
+  const blocks: string[] = [];
+
+  for (const el of elements) {
+    if (el.paragraph) {
+      const rawLine = (el.paragraph.elements ?? [])
+        .map((pe) => pe.textRun?.content ?? '')
+        .join('')
+        .replace(/\r/g, '')
+        .replace(/\n+$/, '')
+        .trim();
+      if (!rawLine) continue;
+
+      const style = el.paragraph.paragraphStyle?.namedStyleType || '';
+      if (style === 'TITLE' || style === 'HEADING_1') {
+        blocks.push(`# ${rawLine}`);
+      } else if (style === 'SUBTITLE' || style === 'HEADING_2') {
+        blocks.push(`## ${rawLine}`);
+      } else if (style === 'HEADING_3' || style === 'HEADING_4') {
+        blocks.push(`### ${rawLine}`);
+      } else if (el.paragraph.bullet) {
+        blocks.push(`- ${rawLine}`);
+      } else {
+        blocks.push(rawLine);
+      }
+    } else if (el.table?.tableRows) {
+      const rowsText: string[] = [];
+      for (const row of el.table.tableRows) {
+        const cellValues = (row.tableCells ?? [])
+          .map((cell) =>
+            extractTextFromStructuralElements(cell.content)
+              .replace(/\s+/g, ' ')
+              .trim()
+          )
+          .filter(Boolean);
+        if (cellValues.length > 0) {
+          rowsText.push(cellValues.join(' | '));
+        }
+      }
+      if (rowsText.length > 0) {
+        blocks.push(rowsText.join('\n'));
+      }
+    }
+  }
+
+  return blocks.join('\n\n');
+}
+
+/**
+ * Reads structured headings, paragraphs, bullets, and tables directly via Google Docs API v1
+ * so imported Google Docs preserve clean passage breaks for Dispatch citations.
+ */
+export async function readStructuredGoogleDocText(
+  accessToken: string,
+  documentId: string
+): Promise<string | null> {
+  const res = await fetch(`${DOCS_API_BASE}/${encodeURIComponent(documentId)}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (res.status === 401) {
+    throw new DriveAuthExpiredError(
+      'Your Google Docs session expired. Sign in with Google to reconnect.'
+    );
+  }
+  if (!res.ok) {
+    return null;
+  }
+
+  const docJson = (await res.json()) as {
+    title?: string;
+    body?: { content?: GoogleDocStructuralElement[] };
+  };
+  const extracted = extractTextFromStructuralElements(docJson.body?.content);
+  if (!extracted.trim()) return null;
+  return extracted;
+}
+
 export async function downloadDriveFileAsBrowserFile(
   accessToken: string,
   item: DriveFileItem
 ): Promise<File> {
-  // Google Workspace native files (Docs, Slides, Sheets) must use the /export endpoint
+  // Native Google Docs: try structured Google Docs API v1 first for clean markdown/passage hierarchy,
+  // then fall back to Drive text/plain export if Docs API is unavailable for the file.
   if (item.mimeType === 'application/vnd.google-apps.document') {
+    const structured = await readStructuredGoogleDocText(accessToken, item.id).catch((err) => {
+      if (err instanceof DriveAuthExpiredError) throw err;
+      return null;
+    });
+
+    if (structured && structured.trim().length > 0) {
+      const baseName = item.name.replace(/\.(md|markdown|txt)$/i, '');
+      return new File([structured], `${baseName}.md`, { type: 'text/markdown' });
+    }
+
     const exportUrl = `${DRIVE_API_BASE}/files/${encodeURIComponent(item.id)}/export?mimeType=text/plain`;
     const res = await fetch(exportUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) await parseDriveError(res);
+    if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
     const text = await res.text();
     const safeName = item.name.endsWith('.txt') ? item.name : `${item.name}.txt`;
     return new File([text], safeName, { type: 'text/plain' });
@@ -294,7 +413,7 @@ export async function downloadDriveFileAsBrowserFile(
     const res = await fetch(exportUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) await parseDriveError(res);
+    if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
     const text = await res.text();
     const safeName = item.name.endsWith('.txt') ? item.name : `${item.name}.txt`;
     return new File([text], safeName, { type: 'text/plain' });
@@ -305,7 +424,7 @@ export async function downloadDriveFileAsBrowserFile(
     const res = await fetch(exportUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) await parseDriveError(res);
+    if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
     const csvText = await res.text();
     const safeName = item.name.replace(/\.csv$/i, '') + '.txt';
     return new File([csvText], safeName, { type: 'text/plain' });
@@ -316,10 +435,10 @@ export async function downloadDriveFileAsBrowserFile(
   const res = await fetch(downloadUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  if (!res.ok) await parseDriveError(res);
+  if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
   const blob = await res.blob();
 
-  let resolvedMime = item.mimeType || blob.type || 'text/plain';
+  const resolvedMime = item.mimeType || blob.type || 'text/plain';
   let resolvedName = item.name;
   const lower = resolvedName.toLowerCase();
 
@@ -331,7 +450,11 @@ export async function downloadDriveFileAsBrowserFile(
     !lower.endsWith('.docx')
   ) {
     resolvedName = `${resolvedName}.docx`;
-  } else if (resolvedMime === 'text/markdown' && !lower.endsWith('.md') && !lower.endsWith('.markdown')) {
+  } else if (
+    resolvedMime === 'text/markdown' &&
+    !lower.endsWith('.md') &&
+    !lower.endsWith('.markdown')
+  ) {
     resolvedName = `${resolvedName}.md`;
   } else if (
     resolvedMime === 'text/plain' &&
@@ -363,7 +486,7 @@ export async function ensureDispatchDriveFolder(
   const searchRes = await fetch(searchUrl.toString(), {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  if (!searchRes.ok) await parseDriveError(searchRes);
+  if (!searchRes.ok) await parseWorkspaceError(searchRes, 'Google Drive');
   const searchData = (await searchRes.json()) as { files?: DriveFileItem[] };
   if (searchData.files && searchData.files.length > 0) {
     return searchData.files[0];
@@ -383,8 +506,151 @@ export async function ensureDispatchDriveFolder(
       }),
     }
   );
-  if (!createRes.ok) await parseDriveError(createRes);
+  if (!createRes.ok) await parseWorkspaceError(createRes, 'Google Drive');
   return (await createRes.json()) as DriveFileItem;
+}
+
+interface FormattedDocBuildResult {
+  fullText: string;
+  requests: Array<Record<string, unknown>>;
+}
+
+/**
+ * Builds deterministic Google Docs API v1 batchUpdate requests with UTF-16 code unit indices
+ * (Google Docs body content starts at index 1).
+ */
+function buildGoogleDocsBatchRequests(briefing: AudioBriefing): FormattedDocBuildResult {
+  let cursor = 1;
+  const chunks: string[] = [];
+  const styleOps: Array<Record<string, unknown>> = [];
+
+  const appendParagraph = (
+    rawText: string,
+    options?: {
+      namedStyle?: 'TITLE' | 'SUBTITLE' | 'HEADING_2' | 'NORMAL_TEXT';
+      boldPrefixLength?: number;
+      italicLine?: boolean;
+    }
+  ): { start: number; end: number } => {
+    const clean = (rawText || ' ').replace(/\r/g, '');
+    const textWithNewline = `${clean}\n`;
+    const start = cursor;
+    const end = cursor + textWithNewline.length;
+    chunks.push(textWithNewline);
+    cursor = end;
+
+    if (options?.namedStyle && options.namedStyle !== 'NORMAL_TEXT') {
+      styleOps.push({
+        updateParagraphStyle: {
+          range: { startIndex: start, endIndex: end },
+          paragraphStyle: { namedStyleType: options.namedStyle },
+          fields: 'namedStyleType',
+        },
+      });
+    }
+
+    if (options?.boldPrefixLength && options.boldPrefixLength > 0 && clean.length > 0) {
+      styleOps.push({
+        updateTextStyle: {
+          range: {
+            startIndex: start,
+            endIndex: Math.min(end - 1, start + options.boldPrefixLength),
+          },
+          textStyle: { bold: true },
+          fields: 'bold',
+        },
+      });
+    }
+
+    if (options?.italicLine && clean.length > 0) {
+      styleOps.push({
+        updateTextStyle: {
+          range: { startIndex: start, endIndex: end - 1 },
+          textStyle: { italic: true },
+          fields: 'italic',
+        },
+      });
+    }
+
+    return { start, end };
+  };
+
+  // Title & Edition Metadata
+  appendParagraph(briefing.editionTitle || 'Dispatch Briefing', {
+    namedStyle: 'TITLE',
+  });
+  if (briefing.editionSubtitle) {
+    appendParagraph(briefing.editionSubtitle, { namedStyle: 'SUBTITLE' });
+  }
+  const createdDate = new Date(briefing.createdAt).toLocaleString();
+  const formatLabel =
+    briefing.preferences.format === 'podcast' ? 'Two-Host Podcast' : 'Solo Anchor';
+  appendParagraph(
+    `Dispatch Studio Edition · ${createdDate} · ${formatLabel} · ${briefing.segments.length} chapters`,
+    { italicLine: true }
+  );
+  appendParagraph(' ');
+
+  // Executive Key Takeaways (with native bullet list formatting)
+  if (briefing.takeaways.length > 0) {
+    appendParagraph('Key Takeaways', { namedStyle: 'HEADING_2' });
+    let bulletStart = -1;
+    let bulletEnd = -1;
+    for (const point of briefing.takeaways) {
+      const range = appendParagraph(point);
+      if (bulletStart === -1) bulletStart = range.start;
+      bulletEnd = range.end;
+    }
+    if (bulletStart !== -1 && bulletEnd > bulletStart) {
+      styleOps.push({
+        createParagraphBullets: {
+          range: { startIndex: bulletStart, endIndex: bulletEnd },
+          bulletPreset: 'BULLET_DISC_CIRCLE_SQUARE',
+        },
+      });
+    }
+    appendParagraph(' ');
+  }
+
+  // Indexed Sources
+  if (briefing.articleTitles.length > 0) {
+    appendParagraph('Sources Indexed', { namedStyle: 'HEADING_2' });
+    briefing.articleTitles.forEach((srcTitle, idx) => {
+      const prefix = `${idx + 1}. `;
+      appendParagraph(`${prefix}${srcTitle}`, { boldPrefixLength: prefix.length });
+    });
+    appendParagraph(' ');
+  }
+
+  // Broadcast Chapters & Speaker Script
+  briefing.segments.forEach((seg, idx) => {
+    appendParagraph(`Chapter ${idx + 1}: ${seg.title}`, {
+      namedStyle: 'HEADING_2',
+    });
+    appendParagraph(`${seg.category} · Key Point: ${seg.keyPoint}`, {
+      italicLine: true,
+    });
+    for (const line of seg.lines) {
+      const speakerPrefix = `${line.speaker}: `;
+      appendParagraph(`${speakerPrefix}${line.text}`, {
+        boldPrefixLength: speakerPrefix.length,
+      });
+    }
+    appendParagraph(' ');
+  });
+
+  const fullText = chunks.join('');
+  const requests: Array<Record<string, unknown>> = [
+    {
+      insertText: {
+        location: { index: 1 },
+        text: fullText,
+      },
+    },
+    ...styleOps,
+  ];
+
+  return { fullText, requests };
 }
 
 function escapeHtml(raw: string): string {
@@ -444,7 +710,7 @@ function buildBriefingHtmlDocument(briefing: AudioBriefing): string {
 </html>`;
 }
 
-export async function uploadBriefingDocToDrive(params: {
+async function uploadBriefingDocViaMultipartFallback(params: {
   accessToken: string;
   briefing: AudioBriefing;
   parentFolderId?: string | null;
@@ -486,8 +752,136 @@ export async function uploadBriefingDocToDrive(params: {
     body: multipartBody,
   });
 
-  if (!res.ok) await parseDriveError(res);
+  if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
   return (await res.json()) as DriveFileItem;
+}
+
+/**
+ * Creates or updates a richly formatted native Google Doc using Google Docs API v1
+ * (`documents.create` + `documents.batchUpdate`) and places it in the target Drive folder.
+ */
+export async function uploadBriefingDocToDrive(params: {
+  accessToken: string;
+  briefing: AudioBriefing;
+  parentFolderId?: string | null;
+  overwriteFileId?: string | null;
+}): Promise<DriveFileItem> {
+  const { accessToken, briefing, parentFolderId, overwriteFileId } = params;
+  const docTitle = briefing.editionTitle || 'Dispatch Briefing';
+  const { requests } = buildGoogleDocsBatchRequests(briefing);
+
+  try {
+    let targetDocId = overwriteFileId || '';
+    const preRequests: Array<Record<string, unknown>> = [];
+
+    if (targetDocId) {
+      // Inspect existing Google Doc endIndex so we can replace its body cleanly
+      const existingRes = await fetch(
+        `${DOCS_API_BASE}/${encodeURIComponent(targetDocId)}`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      if (existingRes.status === 401) {
+        await parseWorkspaceError(existingRes, 'Google Docs');
+      }
+      if (!existingRes.ok) {
+        // Target file may not be a native Google Doc; use multipart fallback
+        return await uploadBriefingDocViaMultipartFallback(params);
+      }
+      const existingJson = (await existingRes.json()) as {
+        body?: { content?: GoogleDocStructuralElement[] };
+      };
+      const contentArr = existingJson.body?.content ?? [];
+      const lastEndIndex =
+        contentArr.length > 0
+          ? contentArr[contentArr.length - 1]?.endIndex ?? 1
+          : 1;
+      if (lastEndIndex > 2) {
+        preRequests.push({
+          deleteContentRange: {
+            range: { startIndex: 1, endIndex: lastEndIndex - 1 },
+          },
+        });
+      }
+    } else {
+      const createRes = await fetch(DOCS_API_BASE, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ title: docTitle }),
+      });
+      if (createRes.status === 401) {
+        await parseWorkspaceError(createRes, 'Google Docs');
+      }
+      if (!createRes.ok) {
+        return await uploadBriefingDocViaMultipartFallback(params);
+      }
+      const createdDoc = (await createRes.json()) as { documentId?: string };
+      if (!createdDoc.documentId) {
+        return await uploadBriefingDocViaMultipartFallback(params);
+      }
+      targetDocId = createdDoc.documentId;
+    }
+
+    const batchRes = await fetch(
+      `${DOCS_API_BASE}/${encodeURIComponent(targetDocId)}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          requests: [...preRequests, ...requests],
+        }),
+      }
+    );
+
+    if (!batchRes.ok) {
+      await parseWorkspaceError(batchRes, 'Google Docs');
+    }
+
+    // Move newly created Google Doc into Dispatch Studio folder (if requested) and fetch Drive metadata
+    const drivePatchUrl = new URL(
+      `${DRIVE_API_BASE}/files/${encodeURIComponent(targetDocId)}`
+    );
+    drivePatchUrl.searchParams.set(
+      'fields',
+      'id,name,mimeType,webViewLink,modifiedTime,parents'
+    );
+    if (!overwriteFileId && parentFolderId) {
+      drivePatchUrl.searchParams.set('addParents', parentFolderId);
+    }
+
+    const metaRes = await fetch(drivePatchUrl.toString(), {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: docTitle }),
+    });
+
+    if (metaRes.ok) {
+      return (await metaRes.json()) as DriveFileItem;
+    }
+
+    return {
+      id: targetDocId,
+      name: docTitle,
+      mimeType: 'application/vnd.google-apps.document',
+      webViewLink: `https://docs.google.com/document/d/${encodeURIComponent(targetDocId)}/edit`,
+      modifiedTime: new Date().toISOString(),
+    };
+  } catch (err) {
+    if (err instanceof DriveAuthExpiredError) {
+      throw err;
+    }
+    return await uploadBriefingDocViaMultipartFallback(params);
+  }
 }
 
 export async function uploadWavEpisodeToDrive(params: {
@@ -532,7 +926,7 @@ export async function uploadWavEpisodeToDrive(params: {
     body: multipartBody,
   });
 
-  if (!res.ok) await parseDriveError(res);
+  if (!res.ok) await parseWorkspaceError(res, 'Google Drive');
   return (await res.json()) as DriveFileItem;
 }
 
@@ -554,7 +948,7 @@ export async function moveDriveFilesToTrash(params: {
       }
     );
     if (!res.ok) {
-      await parseDriveError(res);
+      await parseWorkspaceError(res, 'Google Drive');
     }
   }
 }

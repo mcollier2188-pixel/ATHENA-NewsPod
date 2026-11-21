@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
+  AlertCircle,
   ArrowUpLeft,
   Bookmark,
   BookOpen,
@@ -7,12 +8,16 @@ import {
   Check,
   ExternalLink,
   FileText,
+  HardDrive,
   Headphones,
   Link2,
   Loader2,
+  Minus,
+  RefreshCw,
   RotateCcw,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import {
   VOICE_OPTIONS,
@@ -32,14 +37,20 @@ interface ArticleDeskViewProps {
   readLaterArticles: NewsArticle[];
   preferences: BriefingPreferences;
   onPreferencesChange: (next: BriefingPreferences) => void;
-  onOpenAddModal: (tab: 'upload' | 'url' | 'text') => void;
+  onOpenAddModal: (tab: 'upload' | 'drive' | 'url' | 'text') => void;
   onInspectSource: (sourceId: string) => void;
   onToggleArticle: (id: string) => void;
   onToggleAll: (selected: boolean) => void;
+  onBulkToggleCategory: (category: string, selected: boolean) => void;
   onToggleReadLater: (id: string) => void;
   onRestoreAllReadLater: () => void;
   onRemoveArticle: (id: string) => void;
   onResetSamples: () => void;
+  onRefreshAllArticles: () => Promise<void>;
+  isRefreshingArticles: boolean;
+  refreshArticlesStatus: string | null;
+  refreshArticlesError: string | null;
+  onDismissRefreshError: () => void;
   onBuildBriefing: (autoSynthesize: boolean) => Promise<void>;
   isGenerating: boolean;
   generationStatus: string | null;
@@ -100,10 +111,16 @@ export function ArticleDeskView({
   onInspectSource,
   onToggleArticle,
   onToggleAll,
+  onBulkToggleCategory,
   onToggleReadLater,
   onRestoreAllReadLater,
   onRemoveArticle,
   onResetSamples,
+  onRefreshAllArticles,
+  isRefreshingArticles,
+  refreshArticlesStatus,
+  refreshArticlesError,
+  onDismissRefreshError,
   onBuildBriefing,
   isGenerating,
   generationStatus,
@@ -118,6 +135,38 @@ export function ArticleDeskView({
     (sum, a) => sum + (a.estimatedReadMinutes || 3),
     0
   );
+  const totalSourcesCount = articles.length + readLaterArticles.length;
+  const urlSourcesCount = [...articles, ...readLaterArticles].filter((a) => {
+    if (a.driveFileId) return false;
+    const rawUrl = a.url?.trim();
+    return Boolean(rawUrl && /^https?:\/\//i.test(rawUrl));
+  }).length;
+
+  const categoryGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      { label: string; total: number; selected: number }
+    >();
+    for (const article of articles) {
+      const label = (article.category || '').trim() || 'General';
+      const key = label.toLowerCase();
+      const existing = groups.get(key);
+      if (existing) {
+        existing.total += 1;
+        if (article.selected) existing.selected += 1;
+      } else {
+        groups.set(key, {
+          label,
+          total: 1,
+          selected: article.selected ? 1 : 0,
+        });
+      }
+    }
+    return Array.from(groups.values()).sort((a, b) => {
+      if (b.total !== a.total) return b.total - a.total;
+      return a.label.localeCompare(b.label);
+    });
+  }, [articles]);
 
   const todayFormatted = new Intl.DateTimeFormat('en-US', {
     weekday: 'long',
@@ -178,10 +227,18 @@ export function ArticleDeskView({
                 <button
                   type="button"
                   onClick={() => onOpenAddModal('upload')}
-                  className="h-9 px-3.5 inline-flex items-center gap-1.5 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] rounded-md transition-colors whitespace-nowrap cursor-pointer"
+                  className="h-9 px-3.5 inline-flex items-center gap-1.5 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <Upload className="w-3.5 h-3.5" aria-hidden="true" />
                   Upload File
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenAddModal('drive')}
+                  className="h-9 px-3.5 inline-flex items-center gap-1.5 text-xs font-medium text-[#F5F7FA] bg-[#181D26] hover:bg-[#1F2734] border border-[#2A3342] hover:border-[#22D3EE]/50 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <HardDrive className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+                  Google Drive
                 </button>
                 <button
                   type="button"
@@ -252,7 +309,35 @@ export function ArticleDeskView({
                 )}
               </div>
 
-              <div className="flex items-center gap-4 text-xs font-medium">
+              <div className="flex flex-wrap items-center gap-3 text-xs font-medium">
+                <button
+                  type="button"
+                  onClick={() => {
+                    void onRefreshAllArticles();
+                  }}
+                  disabled={totalSourcesCount === 0 || isRefreshingArticles}
+                  title={
+                    urlSourcesCount > 0
+                      ? `Re-fetch ${urlSourcesCount} URL ${
+                          urlSourcesCount === 1 ? 'source' : 'sources'
+                        } and regenerate automatic tags`
+                      : 'Regenerate automatic tags for current sources'
+                  }
+                  className="h-8 px-3 inline-flex items-center gap-1.5 text-xs font-medium text-[#F5F7FA] bg-[#161B23] hover:bg-[#1D2532] border border-[#2A3342] hover:border-[#22D3EE]/60 disabled:opacity-45 disabled:pointer-events-none rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 text-[#22D3EE] shrink-0 ${
+                      isRefreshingArticles ? 'animate-spin' : ''
+                    }`}
+                    aria-hidden="true"
+                  />
+                  <span>
+                    {isRefreshingArticles
+                      ? 'Refreshing Articles...'
+                      : 'Refresh All Articles'}
+                  </span>
+                </button>
+
                 {deskTab === 'active' ? (
                   <>
                     {articles.length > 0 && (
@@ -261,7 +346,7 @@ export function ArticleDeskView({
                         onClick={() =>
                           onToggleAll(selectedArticles.length !== articles.length)
                         }
-                        className="text-[#67E8F9] hover:underline whitespace-nowrap cursor-pointer"
+                        className="text-[#67E8F9] hover:underline whitespace-nowrap shrink-0 cursor-pointer"
                       >
                         {selectedArticles.length === articles.length
                           ? 'Deselect all'
@@ -271,7 +356,7 @@ export function ArticleDeskView({
                     <button
                       type="button"
                       onClick={onResetSamples}
-                      className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#F5F7FA] whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#F5F7FA] whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
                       Load samples
@@ -285,7 +370,7 @@ export function ArticleDeskView({
                         onRestoreAllReadLater();
                         setDeskTab('active');
                       }}
-                      className="inline-flex items-center gap-1.5 text-[#67E8F9] hover:text-[#22D3EE] whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1.5 text-[#67E8F9] hover:text-[#22D3EE] whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <ArrowUpLeft className="w-3.5 h-3.5" aria-hidden="true" />
                       Move all to Notebook
@@ -294,6 +379,39 @@ export function ArticleDeskView({
                 )}
               </div>
             </div>
+
+            {isRefreshingArticles && refreshArticlesStatus && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="mt-3 px-3.5 py-2.5 rounded-md border border-[#22D3EE]/35 bg-[#121A24] flex items-center gap-2.5 text-xs text-[#67E8F9]"
+              >
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#22D3EE] shrink-0" aria-hidden="true" />
+                <span className="font-mono tabular-nums truncate">
+                  {refreshArticlesStatus}
+                </span>
+              </div>
+            )}
+
+            {!isRefreshingArticles && refreshArticlesError && (
+              <div
+                role="alert"
+                className="mt-3 px-3.5 py-2.5 rounded-md border border-amber-500/35 bg-amber-950/25 flex items-start justify-between gap-3 text-xs text-amber-200"
+              >
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+                  <span className="leading-relaxed">{refreshArticlesError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={onDismissRefreshError}
+                  aria-label="Dismiss refresh notice"
+                  className="p-0.5 text-amber-300/80 hover:text-amber-100 rounded cursor-pointer shrink-0"
+                >
+                  <X className="w-3.5 h-3.5" aria-hidden="true" />
+                </button>
+              </div>
+            )}
 
             {deskTab === 'active' ? (
               articles.length === 0 ? (
@@ -338,11 +456,101 @@ export function ArticleDeskView({
                   </div>
                 </div>
               ) : (
-                <ul className="divide-y divide-[#1E2430]">
-                  {articles.map((article, index) => {
-                    const hasWorkingImg =
-                      Boolean(article.imageUrl) && !failedImages[article.id];
-                    const passageCount = article.passages?.length || 0;
+                <>
+                  {categoryGroups.length > 0 && (
+                    <div
+                      role="region"
+                      aria-label="Bulk Toggle by Source Category"
+                      className="py-3.5 border-b border-[#1E2430] space-y-2.5"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="font-semibold text-[#F5F7FA]">
+                            Bulk Toggle
+                          </span>
+                          <span aria-hidden="true" className="text-[#4B5565]">
+                            ·
+                          </span>
+                          <span className="text-[#8C96A8]">
+                            Click a source category to select or deselect matching articles
+                          </span>
+                        </div>
+                        <span className="font-mono text-[11px] text-[#6E788A] tabular-nums">
+                          {categoryGroups.length}{' '}
+                          {categoryGroups.length === 1 ? 'category' : 'categories'}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {categoryGroups.map((group) => {
+                          const allInCategorySelected =
+                            group.total > 0 && group.selected === group.total;
+                          const someInCategorySelected =
+                            group.selected > 0 && group.selected < group.total;
+
+                          return (
+                            <button
+                              key={group.label.toLowerCase()}
+                              type="button"
+                              role="checkbox"
+                              aria-checked={
+                                allInCategorySelected
+                                  ? true
+                                  : someInCategorySelected
+                                    ? 'mixed'
+                                    : false
+                              }
+                              aria-label={`${
+                                allInCategorySelected ? 'Deselect' : 'Select'
+                              } all ${group.label} articles (${group.selected} of ${
+                                group.total
+                              } selected)`}
+                              onClick={() =>
+                                onBulkToggleCategory(
+                                  group.label,
+                                  !allInCategorySelected
+                                )
+                              }
+                              className={`h-8 px-2.5 inline-flex items-center gap-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                allInCategorySelected
+                                  ? 'bg-[#16222E] text-[#F5F7FA] border-[#22D3EE]/60 hover:border-[#67E8F9]'
+                                  : someInCategorySelected
+                                    ? 'bg-[#131C26] text-[#D5DCE6] border-[#22D3EE]/35 hover:border-[#22D3EE]/65'
+                                    : 'bg-[#11151C] text-[#8C96A8] border-[#222833] hover:border-[#22D3EE]/45 hover:text-[#F5F7FA]'
+                              }`}
+                            >
+                              <span
+                                aria-hidden="true"
+                                className={`w-3.5 h-3.5 rounded-xs border flex items-center justify-center shrink-0 transition-colors ${
+                                  allInCategorySelected
+                                    ? 'bg-[#22D3EE] border-[#22D3EE] text-[#071318]'
+                                    : someInCategorySelected
+                                      ? 'bg-[#182430] border-[#22D3EE] text-[#67E8F9]'
+                                      : 'bg-[#0B0D10] border-[#394457]'
+                                }`}
+                              >
+                                {allInCategorySelected ? (
+                                  <Check className="w-2.5 h-2.5" strokeWidth={3} />
+                                ) : someInCategorySelected ? (
+                                  <Minus className="w-2.5 h-2.5" strokeWidth={3} />
+                                ) : null}
+                              </span>
+                              <span>{group.label}</span>
+                              <span className="font-mono text-[11px] text-[#67E8F9]/85 tabular-nums">
+                                {group.selected}/{group.total}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  <ul className="divide-y divide-[#1E2430]">
+                    {articles.map((article, index) => {
+                      const hasWorkingImg =
+                        Boolean(article.imageUrl) && !failedImages[article.id];
+                      const passageCount = article.passages?.length || 0;
 
                     return (
                       <li
@@ -429,17 +637,27 @@ export function ArticleDeskView({
                                 </button>
                               )}
 
-                              {article.url && (
+                              {article.driveWebViewLink ? (
+                                <a
+                                  href={article.driveWebViewLink}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#67E8F9] transition-colors whitespace-nowrap"
+                                >
+                                  Open in Drive
+                                  <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                                </a>
+                              ) : article.url ? (
                                 <a
                                   href={article.url}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#F5F7FA] transition-colors"
+                                  className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#F5F7FA] transition-colors whitespace-nowrap"
                                 >
                                   Source link
                                   <ExternalLink className="w-3 h-3" aria-hidden="true" />
                                 </a>
-                              )}
+                              ) : null}
 
                               <button
                                 type="button"
@@ -478,7 +696,8 @@ export function ArticleDeskView({
                       </li>
                     );
                   })}
-                </ul>
+                  </ul>
+                </>
               )
             ) : readLaterArticles.length === 0 ? (
               <div className="py-14 text-center border-b border-[#222833]">

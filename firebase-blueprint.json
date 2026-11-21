@@ -510,6 +510,390 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "NotebookSource": {
+      "title": "NotebookSource",
+      "description": "Owner-scoped notebook research source (Active or Read Later) synchronized across devices with passage metadata and optional Google Drive provenance.",
+      "type": "object",
+      "properties": {
+        "docId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic owner-scoped Firestore document ID (src_<uid>_<sourceId>)."
+        },
+        "sourceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Client source identifier used for passage citations."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the source owner."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Source document or article headline."
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Origin label (publication name, Google Docs, Google Drive, or uploaded file)."
+        },
+        "sourceType": {
+          "type": "string",
+          "enum": ["article", "pdf", "docx", "txt", "markdown"],
+          "description": "Normalized source document type."
+        },
+        "fileSizeLabel": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64,
+          "description": "Formatted file size label or empty string."
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Editorial topic category."
+        },
+        "tags": {
+          "type": "array",
+          "description": "Bounded list (max 12) of topic tags (each <= 80 chars)."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Canonical web URL or Google Drive webViewLink."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000,
+          "description": "Concise source summary."
+        },
+        "keyFacts": {
+          "type": "array",
+          "description": "Bounded list (max 12) of extracted key facts (each <= 300 chars)."
+        },
+        "content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 30000,
+          "description": "Bounded full text used to build deterministic numbered passages."
+        },
+        "estimatedReadMinutes": {
+          "type": "number",
+          "description": "Estimated reading time in minutes (1..240)."
+        },
+        "selected": {
+          "type": "boolean",
+          "description": "Whether the source is selected for the next audio briefing."
+        },
+        "readLater": {
+          "type": "boolean",
+          "description": "Whether the source is shelved in the Read Later queue."
+        },
+        "shelvedAt": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64,
+          "description": "ISO timestamp when shelved to Read Later, or empty string."
+        },
+        "driveFileId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Imported Google Drive / Google Docs file ID, or empty string."
+        },
+        "driveWebViewLink": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Google Drive webViewLink for imported Workspace documents, or empty string."
+        },
+        "driveMimeType": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Original Google Drive MIME type, or empty string."
+        },
+        "imageUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Optional non-binary cover image URL (never base64 data URIs)."
+        },
+        "addedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO timestamp when the source was added."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set at creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "docId",
+        "sourceId",
+        "ownerId",
+        "title",
+        "source",
+        "sourceType",
+        "fileSizeLabel",
+        "category",
+        "tags",
+        "url",
+        "summary",
+        "keyFacts",
+        "content",
+        "estimatedReadMinutes",
+        "selected",
+        "readLater",
+        "shelvedAt",
+        "driveFileId",
+        "driveWebViewLink",
+        "driveMimeType",
+        "imageUrl",
+        "addedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BriefingArchive": {
+      "title": "BriefingArchive",
+      "description": "Owner-scoped briefing archive edition storing cited speaker scripts, takeaways, playback progress bookmarks, and exported Google Docs / Drive WAV / Tasks metadata (without binary audio blobs).",
+      "type": "object",
+      "properties": {
+        "docId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic owner-scoped Firestore document ID (brf_<uid>_<briefingId>)."
+        },
+        "briefingId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Client briefing identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the briefing owner."
+        },
+        "briefingCreatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO timestamp when the briefing edition was generated."
+        },
+        "editionTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Briefing edition headline."
+        },
+        "editionSubtitle": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 500,
+          "description": "Briefing edition subtitle."
+        },
+        "takeaways": {
+          "type": "array",
+          "description": "Bounded list (max 30) of executive takeaway strings (each <= 500 chars)."
+        },
+        "takeawayCitations": {
+          "type": "array",
+          "description": "Bounded list (max 30) of citation reference maps."
+        },
+        "preferences": {
+          "type": "object",
+          "description": "Structured briefing generation preferences map."
+        },
+        "articleTitles": {
+          "type": "array",
+          "description": "Bounded list (max 40) of indexed source titles (each <= 300 chars)."
+        },
+        "segments": {
+          "type": "array",
+          "description": "Bounded list (max 24) of chapter script maps stripped of binary audioBase64."
+        },
+        "playback": {
+          "type": "object",
+          "description": "Synchronized playback bookmark map (segmentIndex, currentTime, duration, playbackRate, completed, maxListenedSeconds, updatedAtIso)."
+        },
+        "exportedDocId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Exported Google Doc document ID, or empty string."
+        },
+        "exportedDocUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Exported Google Doc webViewLink, or empty string."
+        },
+        "exportedWavFileId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Exported stitched WAV Google Drive file ID, or empty string."
+        },
+        "exportedWavUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Exported stitched WAV Google Drive webViewLink, or empty string."
+        },
+        "syncedTaskCount": {
+          "type": "number",
+          "description": "Count of Google Tasks created from this briefing's takeaways (0..500)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set at creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "docId",
+        "briefingId",
+        "ownerId",
+        "briefingCreatedAt",
+        "editionTitle",
+        "editionSubtitle",
+        "takeaways",
+        "takeawayCitations",
+        "preferences",
+        "articleTitles",
+        "segments",
+        "playback",
+        "exportedDocId",
+        "exportedDocUrl",
+        "exportedWavFileId",
+        "exportedWavUrl",
+        "syncedTaskCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WorkspaceLink": {
+      "title": "WorkspaceLink",
+      "description": "Owner-scoped cross-reference record linking Dispatch sources and briefings with Google Drive files, formatted Google Docs, Drive WAV exports, and Google Tasks items.",
+      "type": "object",
+      "properties": {
+        "linkId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic owner-scoped Firestore document ID (lnk_<uid>_<key>)."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the owner."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "drive_source",
+            "google_doc_export",
+            "drive_wav_export",
+            "google_task"
+          ],
+          "description": "Google Workspace artifact category."
+        },
+        "externalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Google Drive file ID, Google Doc ID, or Google Task ID."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Human-readable title of the linked Workspace item."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Google Workspace webViewLink or empty string."
+        },
+        "sourceId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Associated Dispatch sourceId, or empty string."
+        },
+        "briefingId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Associated Dispatch briefingId, or empty string."
+        },
+        "createdAtIso": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO-8601 creation timestamp."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set at creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "linkId",
+        "ownerId",
+        "kind",
+        "externalId",
+        "title",
+        "url",
+        "sourceId",
+        "briefingId",
+        "createdAtIso",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -542,6 +926,24 @@
         "$ref": "#/entities/FeedAlertAcknowledgment"
       },
       "description": "User-scoped subscriber growth alert acknowledgment documents synced in real time with the Feed Performance Alert History drawer."
+    },
+    "/notebookSources/{docId}": {
+      "schema": {
+        "$ref": "#/entities/NotebookSource"
+      },
+      "description": "Owner-scoped notebook sources (Active and Read Later) synced across devices with passage indexing and Google Drive provenance."
+    },
+    "/briefingArchives/{docId}": {
+      "schema": {
+        "$ref": "#/entities/BriefingArchive"
+      },
+      "description": "Owner-scoped briefing editions, playback bookmarks, and Google Docs / Drive WAV / Google Tasks export metadata."
+    },
+    "/workspaceLinks/{docId}": {
+      "schema": {
+        "$ref": "#/entities/WorkspaceLink"
+      },
+      "description": "Owner-scoped Google Workspace links connecting Dispatch sources and briefings with Drive files, formatted Docs, WAV episodes, and Tasks."
     }
   }
 }

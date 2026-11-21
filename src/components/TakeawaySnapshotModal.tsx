@@ -5,6 +5,7 @@ import {
   Copy,
   Download,
   FileText,
+  ListChecks,
   Loader2,
   X,
 } from 'lucide-react';
@@ -19,6 +20,7 @@ interface TakeawaySnapshotModalProps {
   open: boolean;
   briefing: AudioBriefing;
   onClose: () => void;
+  onSendToTasks?: () => void;
 }
 
 const ASPECT_OPTIONS: Array<{
@@ -96,6 +98,7 @@ export function TakeawaySnapshotModal({
   open,
   briefing,
   onClose,
+  onSendToTasks,
 }: TakeawaySnapshotModalProps) {
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [aspect, setAspect] = useState<CardAspect>('square');
@@ -546,6 +549,18 @@ export function TakeawaySnapshotModal({
           </button>
 
           <div className="flex flex-wrap items-center gap-2.5">
+            {onSendToTasks && (
+              <button
+                type="button"
+                disabled={isRendering}
+                onClick={onSendToTasks}
+                className="h-10 px-4 inline-flex items-center gap-2 text-xs sm:text-sm font-medium text-[#E4E9F1] hover:text-[#67E8F9] bg-[#161B23] border border-[#273040] hover:border-[#22D3EE]/60 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-45"
+              >
+                <ListChecks className="w-4 h-4 text-[#22D3EE]" aria-hidden="true" />
+                Send to Google Tasks
+              </button>
+            )}
+
             <button
               type="button"
               disabled={isRendering}

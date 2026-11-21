@@ -580,5 +580,307 @@ test('FeedAlertAcknowledgments Security: owner isolation, state-timestamp invari
   );
 });
 
+test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /workspaceLinks) structural and Red Team guards', () => {
+  assert.match(rulesText, /match \/notebookSources\/\{docId\}/);
+  assert.match(rulesText, /isValidNotebookSource\(incoming\(\), docId\)/);
+  assert.match(rulesText, /isNotebookSourceOwnerSyncAction\(\)/);
+  assert.match(rulesText, /match \/briefingArchives\/\{docId\}/);
+  assert.match(rulesText, /isValidBriefingArchive\(incoming\(\), docId\)/);
+  assert.match(rulesText, /isBriefingArchiveOwnerSyncAction\(\)/);
+  assert.match(rulesText, /match \/workspaceLinks\/\{docId\}/);
+  assert.match(rulesText, /isValidWorkspaceLink\(incoming\(\), docId\)/);
+  assert.match(rulesText, /isWorkspaceLinkOwnerUpdateAction\(\)/);
+
+  interface SourcePayload {
+    docId: string;
+    sourceId: string;
+    ownerId: string;
+    title: string;
+    source: string;
+    sourceType: string;
+    fileSizeLabel: string;
+    category: string;
+    tags: string[];
+    url: string;
+    summary: string;
+    keyFacts: string[];
+    content: string;
+    estimatedReadMinutes: number;
+    selected: boolean;
+    readLater: boolean;
+    shelvedAt: string;
+    driveFileId: string;
+    driveWebViewLink: string;
+    driveMimeType: string;
+    imageUrl: string;
+    addedAt: string;
+    createdAt: number;
+    updatedAt: number;
+    [extraKey: string]: unknown;
+  }
+
+  const SOURCE_KEYS = new Set([
+    'docId',
+    'sourceId',
+    'ownerId',
+    'title',
+    'source',
+    'sourceType',
+    'fileSizeLabel',
+    'category',
+    'tags',
+    'url',
+    'summary',
+    'keyFacts',
+    'content',
+    'estimatedReadMinutes',
+    'selected',
+    'readLater',
+    'shelvedAt',
+    'driveFileId',
+    'driveWebViewLink',
+    'driveMimeType',
+    'imageUrl',
+    'addedAt',
+    'createdAt',
+    'updatedAt',
+  ]);
+
+  const isValidSource = (auth: AuthToken, data: SourcePayload, docId: string): boolean => {
+    const keys = Object.keys(data);
+    if (keys.length !== SOURCE_KEYS.size || !keys.every((k) => SOURCE_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      isValidId(data.docId) &&
+      data.docId === docId &&
+      data.sourceId.length >= 1 &&
+      data.sourceId.length <= 128 &&
+      isValidId(data.ownerId) &&
+      data.ownerId === auth.uid &&
+      data.title.length >= 1 &&
+      data.title.length <= 300 &&
+      data.source.length >= 1 &&
+      data.source.length <= 200 &&
+      ['article', 'pdf', 'docx', 'txt', 'markdown'].includes(data.sourceType) &&
+      data.fileSizeLabel.length <= 64 &&
+      data.category.length >= 1 &&
+      data.category.length <= 120 &&
+      Array.isArray(data.tags) &&
+      data.tags.length <= 12 &&
+      data.url.length <= 2048 &&
+      data.summary.length <= 2000 &&
+      Array.isArray(data.keyFacts) &&
+      data.keyFacts.length <= 12 &&
+      data.content.length <= 30000 &&
+      data.estimatedReadMinutes >= 1 &&
+      data.estimatedReadMinutes <= 240 &&
+      typeof data.selected === 'boolean' &&
+      typeof data.readLater === 'boolean' &&
+      data.shelvedAt.length <= 64 &&
+      data.driveFileId.length <= 128 &&
+      data.driveWebViewLink.length <= 2048 &&
+      data.driveMimeType.length <= 128 &&
+      data.imageUrl.length <= 2048 &&
+      data.addedAt.length >= 1 &&
+      data.addedAt.length <= 64 &&
+      typeof data.createdAt === 'number' &&
+      typeof data.updatedAt === 'number'
+    );
+  };
+
+  const evaluateSourceCreate = (
+    auth: AuthToken | null,
+    docId: string,
+    incoming: SourcePayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(docId)) return false;
+    if (!isValidSource(auth, incoming, docId)) return false;
+    return incoming.createdAt === REQ_TIME && incoming.updatedAt === REQ_TIME;
+  };
+
+  const evaluateSourceUpdate = (
+    auth: AuthToken | null,
+    docId: string,
+    existing: SourcePayload,
+    incoming: SourcePayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(docId)) return false;
+    if (!isValidSource(auth, incoming, docId)) return false;
+    return (
+      existing.ownerId === auth.uid &&
+      incoming.docId === existing.docId &&
+      incoming.sourceId === existing.sourceId &&
+      incoming.ownerId === existing.ownerId &&
+      incoming.createdAt === existing.createdAt &&
+      incoming.updatedAt === REQ_TIME
+    );
+  };
+
+  const validDocId = 'src_uid_alice_art_q4_strategy';
+  const baseSource: SourcePayload = {
+    docId: validDocId,
+    sourceId: 'art_q4_strategy',
+    ownerId: 'uid_alice',
+    title: 'Q4 Strategic Briefing Memo',
+    source: 'Google Docs',
+    sourceType: 'markdown',
+    fileSizeLabel: '14 KB',
+    category: 'Strategy',
+    tags: ['Q4', 'Google Docs'],
+    url: 'https://docs.google.com/document/d/doc_123/edit',
+    summary: 'Executive memo imported from Google Docs.',
+    keyFacts: ['Target margin +420 bps'],
+    content: '# Q4 Strategic Briefing\n\nFull structured document text.',
+    estimatedReadMinutes: 4,
+    selected: true,
+    readLater: false,
+    shelvedAt: '',
+    driveFileId: 'doc_123',
+    driveWebViewLink: 'https://docs.google.com/document/d/doc_123/edit',
+    driveMimeType: 'application/vnd.google-apps.document',
+    imageUrl: '',
+    addedAt: '2026-11-21T20:00:00.000Z',
+    createdAt: REQ_TIME,
+    updatedAt: REQ_TIME,
+  };
+
+  // Positive owner create succeeds
+  assert.equal(evaluateSourceCreate(aliceAuth, validDocId, baseSource), true);
+  // Cross-user ownerId spoofing denied
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, { ...baseSource, ownerId: 'uid_bob' }),
+    false
+  );
+  // Injecting OAuth accessToken shadow field into Firestore is strictly PERMISSION_DENIED
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      accessToken: 'ya29.leaked_token',
+    }),
+    false
+  );
+  // Oversized content (> 30,000 chars) is PERMISSION_DENIED
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      content: 'x'.repeat(30_001),
+    }),
+    false
+  );
+  // Immutable sourceId / createdAt tampering on update is PERMISSION_DENIED
+  const existingSource = {
+    ...baseSource,
+    createdAt: REQ_TIME - 5000,
+    updatedAt: REQ_TIME - 5000,
+  };
+  assert.equal(
+    evaluateSourceUpdate(aliceAuth, validDocId, existingSource, {
+      ...existingSource,
+      selected: false,
+      updatedAt: REQ_TIME,
+    }),
+    true
+  );
+  assert.equal(
+    evaluateSourceUpdate(aliceAuth, validDocId, existingSource, {
+      ...existingSource,
+      sourceId: 'tampered_id',
+      updatedAt: REQ_TIME,
+    }),
+    false
+  );
+
+  // WorkspaceLink kind allowlist & OAuth token leak rejection
+  interface LinkPayload {
+    linkId: string;
+    ownerId: string;
+    kind: string;
+    externalId: string;
+    title: string;
+    url: string;
+    sourceId: string;
+    briefingId: string;
+    createdAtIso: string;
+    createdAt: number;
+    updatedAt: number;
+    [extraKey: string]: unknown;
+  }
+
+  const LINK_KEYS = new Set([
+    'linkId',
+    'ownerId',
+    'kind',
+    'externalId',
+    'title',
+    'url',
+    'sourceId',
+    'briefingId',
+    'createdAtIso',
+    'createdAt',
+    'updatedAt',
+  ]);
+
+  const evaluateLinkCreate = (
+    auth: AuthToken | null,
+    docId: string,
+    data: LinkPayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(docId)) return false;
+    const keys = Object.keys(data);
+    if (keys.length !== LINK_KEYS.size || !keys.every((k) => LINK_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      isValidId(data.linkId) &&
+      data.linkId === docId &&
+      data.ownerId === auth.uid &&
+      ['drive_source', 'google_doc_export', 'drive_wav_export', 'google_task'].includes(
+        data.kind
+      ) &&
+      data.externalId.length >= 1 &&
+      data.externalId.length <= 200 &&
+      data.title.length >= 1 &&
+      data.title.length <= 300 &&
+      data.url.length <= 2048 &&
+      data.sourceId.length <= 128 &&
+      data.briefingId.length <= 128 &&
+      data.createdAtIso.length >= 1 &&
+      data.createdAtIso.length <= 64 &&
+      data.createdAt === REQ_TIME &&
+      data.updatedAt === REQ_TIME
+    );
+  };
+
+  const validLinkId = 'lnk_uid_alice_google_task_tsk_99';
+  const baseLink: LinkPayload = {
+    linkId: validLinkId,
+    ownerId: 'uid_alice',
+    kind: 'google_task',
+    externalId: 'tsk_99',
+    title: 'Review Q4 margin assumptions',
+    url: 'https://tasks.google.com',
+    sourceId: '',
+    briefingId: 'brf_1',
+    createdAtIso: '2026-11-21T20:05:00.000Z',
+    createdAt: REQ_TIME,
+    updatedAt: REQ_TIME,
+  };
+
+  assert.equal(evaluateLinkCreate(aliceAuth, validLinkId, baseLink), true);
+  assert.equal(
+    evaluateLinkCreate(aliceAuth, validLinkId, { ...baseLink, kind: 'unknown_kind' }),
+    false
+  );
+  assert.equal(
+    evaluateLinkCreate(aliceAuth, validLinkId, {
+      ...baseLink,
+      oauthToken: 'ya29.forbidden',
+    }),
+    false
+  );
+});
+
+
 
 

@@ -33,6 +33,9 @@ interface AddSourceModalProps {
   errorMessage: string | null;
   onClose: () => void;
   onUploadFiles: (files: FileList | File[]) => Promise<boolean>;
+  onImportDriveItems?: (
+    items: Array<{ file: File; driveItem: DriveFileItem }>
+  ) => Promise<boolean>;
   onIngestUrlOrText: (payload: { url?: string; rawText?: string }) => Promise<boolean>;
 }
 
@@ -44,6 +47,7 @@ export function AddSourceModal({
   errorMessage,
   onClose,
   onUploadFiles,
+  onImportDriveItems,
   onIngestUrlOrText,
 }: AddSourceModalProps) {
   const {
@@ -173,12 +177,14 @@ export function AddSourceModal({
     setIsDownloadingDrive(true);
     setDriveError(null);
     try {
-      const downloadedFiles: File[] = [];
+      const downloadedItems: Array<{ file: File; driveItem: DriveFileItem }> = [];
       for (const item of chosen) {
         const fileObj = await downloadDriveFileAsBrowserFile(driveAccessToken, item);
-        downloadedFiles.push(fileObj);
+        downloadedItems.push({ file: fileObj, driveItem: item });
       }
-      const ok = await onUploadFiles(downloadedFiles);
+      const ok = onImportDriveItems
+        ? await onImportDriveItems(downloadedItems)
+        : await onUploadFiles(downloadedItems.map((d) => d.file));
       if (ok) {
         setSelectedDriveIds(new Set());
         onClose();

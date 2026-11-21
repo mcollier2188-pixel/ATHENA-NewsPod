@@ -7,8 +7,10 @@ import {
   FileCode2,
   FileText,
   Globe,
+  HardDrive,
   Loader2,
   Plus,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   Tag,
@@ -24,9 +26,11 @@ interface SourcesSidebarProps {
   isUploading: boolean;
   uploadStatus: string | null;
   isTagging: boolean;
+  isRefreshingArticles: boolean;
+  refreshArticlesStatus: string | null;
   mobileOpen: boolean;
   onCloseMobile: () => void;
-  onOpenAddModal: (tab?: 'upload' | 'url' | 'text') => void;
+  onOpenAddModal: (tab?: 'upload' | 'drive' | 'url' | 'text') => void;
   onDropFiles: (files: FileList | File[]) => Promise<void>;
   onToggleSource: (id: string) => void;
   onToggleAll: (selected: boolean) => void;
@@ -36,6 +40,7 @@ interface SourcesSidebarProps {
   onRemoveSource: (id: string) => void;
   onResetSamples: () => void;
   onAutoTagSources: () => Promise<void>;
+  onRefreshAllArticles: () => Promise<void>;
 }
 
 function sourceTypeLabel(type?: SourceType): string {
@@ -69,6 +74,8 @@ export function SourcesSidebar({
   isUploading,
   uploadStatus,
   isTagging,
+  isRefreshingArticles,
+  refreshArticlesStatus,
   mobileOpen,
   onCloseMobile,
   onOpenAddModal,
@@ -81,6 +88,7 @@ export function SourcesSidebar({
   onRemoveSource,
   onResetSamples,
   onAutoTagSources,
+  onRefreshAllArticles,
 }: SourcesSidebarProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [drawerTab, setDrawerTab] = useState<'notebook' | 'readLater'>('notebook');
@@ -239,6 +247,40 @@ export function SourcesSidebar({
 
           <button
             type="button"
+            onClick={() => onOpenAddModal('drive')}
+            disabled={isUploading || isRefreshingArticles}
+            className="w-full h-8 px-3 inline-flex items-center justify-center gap-1.5 text-xs font-medium text-[#C7D0DF] hover:text-[#67E8F9] bg-[#0E1116] hover:bg-[#151B24] border border-[#273040] hover:border-[#22D3EE]/45 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <HardDrive className="w-3.5 h-3.5 text-[#22D3EE] shrink-0" aria-hidden="true" />
+            <span>Import from Google Drive</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              void onRefreshAllArticles();
+            }}
+            disabled={
+              sources.length === 0 || isUploading || isRefreshingArticles || isTagging
+            }
+            title="Re-fetch content for all URL sources and regenerate automatic topic tags"
+            className="w-full h-8 px-3 inline-flex items-center justify-center gap-1.5 text-xs font-medium text-[#C7D0DF] hover:text-[#67E8F9] bg-[#0E1116] hover:bg-[#151B24] border border-[#273040] hover:border-[#22D3EE]/45 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <RefreshCw
+              className={`w-3.5 h-3.5 text-[#22D3EE] shrink-0 ${
+                isRefreshingArticles ? 'animate-spin' : ''
+              }`}
+              aria-hidden="true"
+            />
+            <span className="truncate">
+              {isRefreshingArticles
+                ? refreshArticlesStatus || 'Refreshing Articles...'
+                : 'Refresh All Articles'}
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => onOpenAddModal('upload')}
             className={`w-full py-1.5 px-3 rounded-md border border-dashed text-center transition-colors cursor-pointer ${
               isDragging
@@ -246,7 +288,7 @@ export function SourcesSidebar({
                 : 'border-[#273040] hover:border-[#22D3EE]/45 text-[#6E788A] hover:text-[#A0AABB]'
             }`}
           >
-            <span className="inline-flex items-center justify-center gap-1.5 text-[11px]">
+            <span className="inline-flex items-center justify-center gap-1.5 text-[11px] whitespace-nowrap">
               <Upload className="w-3 h-3" aria-hidden="true" />
               Drop PDF, DOCX, TXT, or MD
             </span>
@@ -487,6 +529,12 @@ export function SourcesSidebar({
                             <>
                               <span aria-hidden="true">·</span>
                               <span>{passageCount}p</span>
+                            </>
+                          )}
+                          {src.driveWebViewLink && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span>Drive</span>
                             </>
                           )}
                         </div>

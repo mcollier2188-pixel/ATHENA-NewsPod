@@ -60,6 +60,12 @@ service cloud.firestore {
         && (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 300));
     }
 
+    function isBoundedListOfStringsWithMax(listVal, maxItems, maxItemLen) {
+      return listVal is list
+        && listVal.size() <= maxItems
+        && (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= maxItemLen));
+    }
+
     function isBoundedListOfMaps(listVal, maxItems) {
       return listVal is list
         && listVal.size() <= maxItems
@@ -576,6 +582,277 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidNotebookSource(data, docId) {
+      return data.keys().hasAll([
+        'docId',
+        'sourceId',
+        'ownerId',
+        'title',
+        'source',
+        'sourceType',
+        'fileSizeLabel',
+        'category',
+        'tags',
+        'url',
+        'summary',
+        'keyFacts',
+        'content',
+        'estimatedReadMinutes',
+        'selected',
+        'readLater',
+        'shelvedAt',
+        'driveFileId',
+        'driveWebViewLink',
+        'driveMimeType',
+        'imageUrl',
+        'addedAt',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'docId',
+        'sourceId',
+        'ownerId',
+        'title',
+        'source',
+        'sourceType',
+        'fileSizeLabel',
+        'category',
+        'tags',
+        'url',
+        'summary',
+        'keyFacts',
+        'content',
+        'estimatedReadMinutes',
+        'selected',
+        'readLater',
+        'shelvedAt',
+        'driveFileId',
+        'driveWebViewLink',
+        'driveMimeType',
+        'imageUrl',
+        'addedAt',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.docId)
+      && data.docId == docId
+      && isBoundedString(data.sourceId, 1, 128)
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isBoundedString(data.title, 1, 300)
+      && isBoundedString(data.source, 1, 200)
+      && data.sourceType in ['article', 'pdf', 'docx', 'txt', 'markdown']
+      && isBoundedString(data.fileSizeLabel, 0, 64)
+      && isBoundedString(data.category, 1, 120)
+      && isBoundedListOfStringsWithMax(data.tags, 12, 80)
+      && isBoundedString(data.url, 0, 2048)
+      && isBoundedString(data.summary, 0, 2000)
+      && isBoundedListOfStringsWithMax(data.keyFacts, 12, 300)
+      && isBoundedString(data.content, 0, 30000)
+      && data.estimatedReadMinutes is number
+      && data.estimatedReadMinutes >= 1
+      && data.estimatedReadMinutes <= 240
+      && data.selected is bool
+      && data.readLater is bool
+      && isBoundedString(data.shelvedAt, 0, 64)
+      && isBoundedString(data.driveFileId, 0, 128)
+      && isBoundedString(data.driveWebViewLink, 0, 2048)
+      && isBoundedString(data.driveMimeType, 0, 128)
+      && isBoundedString(data.imageUrl, 0, 2048)
+      && isBoundedString(data.addedAt, 1, 64)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidBriefingPreferencesMap(p) {
+      return p is map
+        && p.keys().hasAll([
+          'durationMinutes',
+          'format',
+          'tone',
+          'voiceTone',
+          'voiceName',
+          'coHostVoiceName',
+          'dynamicPanel',
+          'segmentCoHostVoices',
+          'listenerFocus',
+          'personalizedIntroduction'
+        ])
+        && p.keys().hasOnly([
+          'durationMinutes',
+          'format',
+          'tone',
+          'voiceTone',
+          'voiceName',
+          'coHostVoiceName',
+          'dynamicPanel',
+          'segmentCoHostVoices',
+          'listenerFocus',
+          'personalizedIntroduction'
+        ])
+        && p.durationMinutes in [3, 5, 10]
+        && p.format in ['solo', 'podcast']
+        && p.tone in ['executive', 'conversational', 'analytical', 'upbeat']
+        && p.voiceTone in ['professional', 'casual', 'energetic', 'soothing']
+        && isBoundedString(p.voiceName, 1, 64)
+        && isBoundedString(p.coHostVoiceName, 1, 64)
+        && p.dynamicPanel is bool
+        && p.segmentCoHostVoices is map
+        && p.segmentCoHostVoices.keys().size() <= 40
+        && isBoundedString(p.listenerFocus, 0, 2000)
+        && isBoundedString(p.personalizedIntroduction, 0, 2000);
+    }
+
+    function isValidBriefingPlaybackMap(pb) {
+      return pb is map
+        && pb.keys().hasAll([
+          'segmentIndex',
+          'currentTime',
+          'duration',
+          'playbackRate',
+          'completed',
+          'maxListenedSeconds',
+          'updatedAtIso'
+        ])
+        && pb.keys().hasOnly([
+          'segmentIndex',
+          'currentTime',
+          'duration',
+          'playbackRate',
+          'completed',
+          'maxListenedSeconds',
+          'updatedAtIso'
+        ])
+        && pb.segmentIndex is number
+        && pb.segmentIndex >= 0
+        && pb.segmentIndex <= 24
+        && pb.currentTime is number
+        && pb.currentTime >= 0
+        && pb.currentTime <= 14400
+        && pb.duration is number
+        && pb.duration >= 0
+        && pb.duration <= 14400
+        && pb.playbackRate is number
+        && pb.playbackRate >= 0.5
+        && pb.playbackRate <= 3
+        && pb.completed is bool
+        && pb.maxListenedSeconds is number
+        && pb.maxListenedSeconds >= 0
+        && pb.maxListenedSeconds <= 86400
+        && isBoundedString(pb.updatedAtIso, 0, 64);
+    }
+
+    function isValidBriefingArchive(data, docId) {
+      return data.keys().hasAll([
+        'docId',
+        'briefingId',
+        'ownerId',
+        'briefingCreatedAt',
+        'editionTitle',
+        'editionSubtitle',
+        'takeaways',
+        'takeawayCitations',
+        'preferences',
+        'articleTitles',
+        'segments',
+        'playback',
+        'exportedDocId',
+        'exportedDocUrl',
+        'exportedWavFileId',
+        'exportedWavUrl',
+        'syncedTaskCount',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'docId',
+        'briefingId',
+        'ownerId',
+        'briefingCreatedAt',
+        'editionTitle',
+        'editionSubtitle',
+        'takeaways',
+        'takeawayCitations',
+        'preferences',
+        'articleTitles',
+        'segments',
+        'playback',
+        'exportedDocId',
+        'exportedDocUrl',
+        'exportedWavFileId',
+        'exportedWavUrl',
+        'syncedTaskCount',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.docId)
+      && data.docId == docId
+      && isBoundedString(data.briefingId, 1, 128)
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isBoundedString(data.briefingCreatedAt, 1, 64)
+      && isBoundedString(data.editionTitle, 1, 300)
+      && isBoundedString(data.editionSubtitle, 0, 500)
+      && isBoundedListOfStringsWithMax(data.takeaways, 30, 500)
+      && isBoundedListOfMaps(data.takeawayCitations, 30)
+      && isValidBriefingPreferencesMap(data.preferences)
+      && isBoundedListOfStringsWithMax(data.articleTitles, 40, 300)
+      && isBoundedListOfMaps(data.segments, 24)
+      && isValidBriefingPlaybackMap(data.playback)
+      && isBoundedString(data.exportedDocId, 0, 128)
+      && isBoundedString(data.exportedDocUrl, 0, 2048)
+      && isBoundedString(data.exportedWavFileId, 0, 128)
+      && isBoundedString(data.exportedWavUrl, 0, 2048)
+      && data.syncedTaskCount is number
+      && data.syncedTaskCount >= 0
+      && data.syncedTaskCount <= 500
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkspaceLink(data, docId) {
+      return data.keys().hasAll([
+        'linkId',
+        'ownerId',
+        'kind',
+        'externalId',
+        'title',
+        'url',
+        'sourceId',
+        'briefingId',
+        'createdAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'linkId',
+        'ownerId',
+        'kind',
+        'externalId',
+        'title',
+        'url',
+        'sourceId',
+        'briefingId',
+        'createdAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.linkId)
+      && data.linkId == docId
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.kind in ['drive_source', 'google_doc_export', 'drive_wav_export', 'google_task']
+      && isBoundedString(data.externalId, 1, 200)
+      && isBoundedString(data.title, 1, 300)
+      && isBoundedString(data.url, 0, 2048)
+      && isBoundedString(data.sourceId, 0, 128)
+      && isBoundedString(data.briefingId, 0, 128)
+      && isBoundedString(data.createdAtIso, 1, 64)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
     // ---------- Action Helpers for Updates ----------
 
     function isSelfProfileMetadataSyncAction(userId) {
@@ -676,6 +953,35 @@ service cloud.firestore {
         && incoming().feedId == existing().feedId
         && incoming().alertKey == existing().alertKey
         && incoming().eventType == existing().eventType
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function isNotebookSourceOwnerSyncAction() {
+      return isOwner(existing().ownerId)
+        && incoming().docId == existing().docId
+        && incoming().sourceId == existing().sourceId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function isBriefingArchiveOwnerSyncAction() {
+      return isOwner(existing().ownerId)
+        && incoming().docId == existing().docId
+        && incoming().briefingId == existing().briefingId
+        && incoming().ownerId == existing().ownerId
+        && incoming().briefingCreatedAt == existing().briefingCreatedAt
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function isWorkspaceLinkOwnerUpdateAction() {
+      return isOwner(existing().ownerId)
+        && incoming().linkId == existing().linkId
+        && incoming().ownerId == existing().ownerId
+        && incoming().kind == existing().kind
+        && incoming().externalId == existing().externalId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time;
     }
@@ -1034,6 +1340,180 @@ service cloud.firestore {
           (resource != null && existing().ownerId == request.auth.uid)
           || isPrincipalOwner()
         );
+    }
+
+    // ---------- Collection: /notebookSources/{docId} ----------
+
+    match /notebookSources/{docId} {
+      allow get: if isVerifiedUser()
+        && isValidId(docId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (docId.matches('^src_' + request.auth.uid + '_[a-zA-Z0-9_\\-]+$') || isPrincipalOwner()))
+        );
+
+      // Zero get()/exists() inside list: strictly enforces owner-scoped where('ownerId', '==', request.auth.uid) queries
+      allow list: if isVerifiedUser()
+        && ('ownerId' in existing() && existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidNotebookSource(incoming(), docId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidNotebookSource(incoming(), docId)
+        && (
+          // Action 1: Owner toggling selection or Read Later state
+          (
+            isNotebookSourceOwnerSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'selected',
+              'readLater',
+              'shelvedAt',
+              'updatedAt'
+            ])
+          )
+          // Action 2: Owner syncing tags, metadata, or Drive link updates
+          || (
+            isNotebookSourceOwnerSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'title',
+              'source',
+              'sourceType',
+              'fileSizeLabel',
+              'category',
+              'tags',
+              'url',
+              'summary',
+              'keyFacts',
+              'content',
+              'estimatedReadMinutes',
+              'selected',
+              'readLater',
+              'shelvedAt',
+              'driveFileId',
+              'driveWebViewLink',
+              'driveMimeType',
+              'imageUrl',
+              'addedAt',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(docId)
+        && resource != null
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // ---------- Collection: /briefingArchives/{docId} ----------
+
+    match /briefingArchives/{docId} {
+      allow get: if isVerifiedUser()
+        && isValidId(docId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (docId.matches('^brf_' + request.auth.uid + '_[a-zA-Z0-9_\\-]+$') || isPrincipalOwner()))
+        );
+
+      // Zero get()/exists() inside list: strictly enforces owner-scoped where('ownerId', '==', request.auth.uid) queries
+      allow list: if isVerifiedUser()
+        && ('ownerId' in existing() && existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidBriefingArchive(incoming(), docId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidBriefingArchive(incoming(), docId)
+        && (
+          // Action 1: Owner updating playback bookmark or Workspace export links
+          (
+            isBriefingArchiveOwnerSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'playback',
+              'exportedDocId',
+              'exportedDocUrl',
+              'exportedWavFileId',
+              'exportedWavUrl',
+              'syncedTaskCount',
+              'updatedAt'
+            ])
+          )
+          // Action 2: Owner syncing script edits, takeaways, or recorded chapter durations
+          || (
+            isBriefingArchiveOwnerSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'editionTitle',
+              'editionSubtitle',
+              'takeaways',
+              'takeawayCitations',
+              'preferences',
+              'articleTitles',
+              'segments',
+              'playback',
+              'exportedDocId',
+              'exportedDocUrl',
+              'exportedWavFileId',
+              'exportedWavUrl',
+              'syncedTaskCount',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(docId)
+        && resource != null
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // ---------- Collection: /workspaceLinks/{docId} ----------
+
+    match /workspaceLinks/{docId} {
+      allow get: if isVerifiedUser()
+        && isValidId(docId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (docId.matches('^lnk_' + request.auth.uid + '_[a-zA-Z0-9_\\-]+$') || isPrincipalOwner()))
+        );
+
+      // Zero get()/exists() inside list: strictly enforces owner-scoped where('ownerId', '==', request.auth.uid) queries
+      allow list: if isVerifiedUser()
+        && ('ownerId' in existing() && existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidWorkspaceLink(incoming(), docId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(docId)
+        && isValidWorkspaceLink(incoming(), docId)
+        && (
+          isWorkspaceLinkOwnerUpdateAction()
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'url',
+            'sourceId',
+            'briefingId',
+            'createdAtIso',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(docId)
+        && resource != null
+        && existing().ownerId == request.auth.uid;
     }
   }
 }

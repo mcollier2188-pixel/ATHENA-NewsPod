@@ -5,13 +5,17 @@ import {
   ChevronDown,
   ChevronUp,
   Download,
+  ExternalLink,
   Globe,
+  HardDrive,
   Headphones,
+  ListChecks,
   Loader2,
   Maximize2,
   Pause,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   RotateCcw,
   Search,
@@ -61,6 +65,8 @@ interface BriefingStudioViewProps {
   onOpenCommuteMode: () => void;
   onPreviewShare: (shareId: string) => void;
   onProjectBriefingTo3D?: (briefing: AudioBriefing) => void;
+  onOpenDriveExport?: () => void;
+  onSendTakeawaysToTasks?: (indices?: number[]) => void;
 }
 
 const REFINE_PRESETS = [
@@ -94,6 +100,8 @@ export function BriefingStudioView({
   onOpenCommuteMode,
   onPreviewShare,
   onProjectBriefingTo3D,
+  onOpenDriveExport,
+  onSendTakeawaysToTasks,
 }: BriefingStudioViewProps) {
   const [refinePrompt, setRefinePrompt] = useState('');
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
@@ -422,17 +430,81 @@ export function BriefingStudioView({
             </button>
           )}
 
+          {onOpenDriveExport && (
+            <button
+              type="button"
+              onClick={onOpenDriveExport}
+              className="h-10 px-4 inline-flex items-center gap-2 text-sm font-medium text-[#F5F7FA] bg-[#13161C] border border-[#2A3342] hover:border-[#22D3EE]/60 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <HardDrive className="w-4 h-4 text-[#22D3EE]" aria-hidden="true" />
+              Google Docs &amp; Drive
+            </button>
+          )}
+
+          {onSendTakeawaysToTasks && briefing.takeaways.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onSendTakeawaysToTasks()}
+              className="h-10 px-4 inline-flex items-center gap-2 text-sm font-medium text-[#F5F7FA] bg-[#13161C] border border-[#2A3342] hover:border-[#22D3EE]/60 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <ListChecks className="w-4 h-4 text-[#22D3EE]" aria-hidden="true" />
+              Google Tasks
+            </button>
+          )}
+
           {onProjectBriefingTo3D && (
             <button
               type="button"
               onClick={() => onProjectBriefingTo3D(briefing)}
-              className="h-10 px-4 inline-flex items-center gap-2 text-sm font-medium text-[#67E8F9] bg-[#13161C] border border-[#22D3EE]/50 hover:border-[#22D3EE] rounded-md transition-colors whitespace-nowrap cursor-pointer"
+              className="h-10 px-4 inline-flex items-center gap-2 text-sm font-medium text-[#67E8F9] bg-[#13161C] border border-[#22D3EE]/50 hover:border-[#22D3EE] rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Box className="w-4 h-4 text-[#22D3EE]" aria-hidden="true" />
               3D Foil Stage
             </button>
           )}
         </div>
+
+        {(briefing.exportedDocUrl ||
+          briefing.exportedWavUrl ||
+          (briefing.syncedTaskCount && briefing.syncedTaskCount > 0)) && (
+          <div className="mt-3.5 flex flex-wrap items-center gap-2.5 text-xs text-[#8C96A8] tabular-nums">
+            {briefing.exportedDocUrl && (
+              <a
+                href={briefing.exportedDocUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-[#67E8F9] hover:underline whitespace-nowrap"
+              >
+                Open Google Doc
+                <ExternalLink className="w-3 h-3" aria-hidden="true" />
+              </a>
+            )}
+            {briefing.exportedDocUrl && briefing.exportedWavUrl && (
+              <span aria-hidden="true">·</span>
+            )}
+            {briefing.exportedWavUrl && (
+              <a
+                href={briefing.exportedWavUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-[#67E8F9] hover:underline whitespace-nowrap"
+              >
+                Open WAV in Drive
+                <ExternalLink className="w-3 h-3" aria-hidden="true" />
+              </a>
+            )}
+            {(briefing.exportedDocUrl || briefing.exportedWavUrl) &&
+              Boolean(briefing.syncedTaskCount && briefing.syncedTaskCount > 0) && (
+                <span aria-hidden="true">·</span>
+              )}
+            {Boolean(briefing.syncedTaskCount && briefing.syncedTaskCount > 0) && (
+              <span className="font-mono text-[#A0AABB]">
+                {briefing.syncedTaskCount}{' '}
+                {briefing.syncedTaskCount === 1 ? 'task' : 'tasks'} synced
+              </span>
+            )}
+          </div>
+        )}
 
         {ttsError && (
           <p
@@ -483,35 +555,63 @@ export function BriefingStudioView({
         <aside className="xl:col-span-4 space-y-6">
           {/* Executive Takeaways with Clickable Citations */}
           <section className="bg-[#13161C] border border-[#22D3EE]/30 rounded-lg p-6">
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-serif text-lg font-medium text-[#F5F7FA]">
                 Key Takeaways
               </h2>
               {briefing.takeaways.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setSnapshotOpen(true)}
-                  className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-medium text-[#67E8F9] bg-[#0E1116] border border-[#22D3EE]/40 hover:border-[#22D3EE] rounded-md transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <Share2 className="w-3.5 h-3.5" aria-hidden="true" />
-                  Share Card
-                </button>
+                <div className="flex items-center gap-1.5">
+                  {onSendTakeawaysToTasks && (
+                    <button
+                      type="button"
+                      onClick={() => onSendTakeawaysToTasks()}
+                      className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-medium text-[#E4E9F1] hover:text-[#67E8F9] bg-[#0E1116] border border-[#273040] hover:border-[#22D3EE]/60 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <ListChecks className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+                      Send to Tasks
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setSnapshotOpen(true)}
+                    className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-medium text-[#67E8F9] bg-[#0E1116] border border-[#22D3EE]/40 hover:border-[#22D3EE] rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Share2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    Share Card
+                  </button>
+                </div>
               )}
             </div>
             <ol className="mt-4 space-y-3.5">
               {briefing.takeaways.map((point, idx) => (
-                <li key={idx} className="flex items-start gap-3 text-sm text-[#D5DCE6] leading-relaxed">
-                  <span className="font-mono text-xs text-[#22D3EE] mt-0.5 tabular-nums shrink-0">
-                    {String(idx + 1).padStart(2, '0')}.
-                  </span>
-                  <span>
-                    <CitedText
-                      text={point}
-                      citations={briefing.takeawayCitations}
-                      onSelectCitation={onSelectCitation}
-                      highlightQuery={normalizedQuery}
-                    />
-                  </span>
+                <li
+                  key={idx}
+                  className="group flex items-start justify-between gap-3 text-sm text-[#D5DCE6] leading-relaxed"
+                >
+                  <div className="flex items-start gap-3 min-w-0 flex-1">
+                    <span className="font-mono text-xs text-[#22D3EE] mt-0.5 tabular-nums shrink-0">
+                      {String(idx + 1).padStart(2, '0')}.
+                    </span>
+                    <span className="min-w-0">
+                      <CitedText
+                        text={point}
+                        citations={briefing.takeawayCitations}
+                        onSelectCitation={onSelectCitation}
+                        highlightQuery={normalizedQuery}
+                      />
+                    </span>
+                  </div>
+                  {onSendTakeawaysToTasks && (
+                    <button
+                      type="button"
+                      onClick={() => onSendTakeawaysToTasks([idx])}
+                      title="Add this takeaway to Google Tasks"
+                      className="mt-0.5 inline-flex items-center gap-1 text-[11px] font-medium text-[#8C96A8] hover:text-[#67E8F9] whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+                    >
+                      <Plus className="w-3 h-3 text-[#22D3EE]" aria-hidden="true" />
+                      Add task
+                    </button>
+                  )}
                 </li>
               ))}
             </ol>
@@ -1002,6 +1102,14 @@ export function BriefingStudioView({
         open={snapshotOpen}
         briefing={briefing}
         onClose={() => setSnapshotOpen(false)}
+        onSendToTasks={
+          onSendTakeawaysToTasks
+            ? () => {
+                setSnapshotOpen(false);
+                onSendTakeawaysToTasks();
+              }
+            : undefined
+        }
       />
 
       <ShareBriefingModal

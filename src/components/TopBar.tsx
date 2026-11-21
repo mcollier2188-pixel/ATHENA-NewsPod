@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertCircle, LogIn, LogOut, RefreshCw, ShieldCheck, X } from 'lucide-react';
+import {
+  AlertCircle,
+  HardDrive,
+  ListChecks,
+  LogIn,
+  LogOut,
+  RefreshCw,
+  ShieldCheck,
+  X,
+} from 'lucide-react';
 import type { ActiveView } from '../types';
 import { useAuth } from '../contexts/AuthContext';
 
 interface TopBarProps {
   activeView: ActiveView;
   onSelectView: (view: ActiveView) => void;
+  onOpenGoogleDrive?: () => void;
+  onOpenGoogleTasks?: () => void;
 }
 
 type TopNavSection = 'newsroom' | 'chat' | 'media' | 'mockup' | 'spatial';
@@ -32,7 +43,12 @@ function getActiveSection(view: ActiveView): TopNavSection | null {
   return view;
 }
 
-export function TopBar({ activeView, onSelectView }: TopBarProps) {
+export function TopBar({
+  activeView,
+  onSelectView,
+  onOpenGoogleDrive,
+  onOpenGoogleTasks,
+}: TopBarProps) {
   const {
     user,
     role,
@@ -179,6 +195,36 @@ export function TopBar({ activeView, onSelectView }: TopBarProps) {
                       {user.email}
                     </div>
                   </div>
+
+                  {onOpenGoogleDrive && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onOpenGoogleDrive();
+                      }}
+                      className="mt-1 w-full h-9 px-2.5 inline-flex items-center gap-2 text-xs font-medium text-[#E4E9F1] hover:text-[#67E8F9] hover:bg-white/5 rounded-md whitespace-nowrap cursor-pointer"
+                    >
+                      <HardDrive className="w-3.5 h-3.5 text-[#22D3EE] shrink-0" />
+                      Google Drive &amp; Docs
+                    </button>
+                  )}
+
+                  {onOpenGoogleTasks && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onOpenGoogleTasks();
+                      }}
+                      className="mt-1 w-full h-9 px-2.5 inline-flex items-center gap-2 text-xs font-medium text-[#E4E9F1] hover:text-[#67E8F9] hover:bg-white/5 rounded-md whitespace-nowrap cursor-pointer"
+                    >
+                      <ListChecks className="w-3.5 h-3.5 text-[#22D3EE] shrink-0" />
+                      Google Tasks
+                    </button>
+                  )}
 
                   {isAdminOrOwner && (
                     <button

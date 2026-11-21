@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { BookOpen, Check, Copy, Plus } from 'lucide-react';
+import { BookOpen, Check, Copy, HardDrive, ListChecks, Plus } from 'lucide-react';
 import {
   VOICE_OPTIONS,
   type ActiveView,
@@ -13,6 +13,7 @@ import {
   type PlaybackPosition,
   type ScriptLine,
   type VoiceName,
+  type WorkspaceLinkItem,
 } from './types';
 import { useAuth } from './contexts/AuthContext';
 import {
@@ -44,7 +45,9 @@ import { ensureArticlePassages } from './utils/passages';
 import { TopBar } from './components/TopBar';
 import { SourcesSidebar } from './components/SourcesSidebar';
 import { SourceInspectorDrawer } from './components/SourceInspectorDrawer';
-import { AddSourceModal } from './components/AddSourceModal';
+import { AddSourceModal, type AddSourceTab } from './components/AddSourceModal';
+import { GoogleDriveModal } from './components/GoogleDriveModal';
+import { GoogleTasksDrawer } from './components/GoogleTasksDrawer';
 import { ArticleDeskView } from './components/ArticleDeskView';
 import { BriefingStudioView } from './components/BriefingStudioView';
 import { ArchiveView } from './components/ArchiveView';
@@ -55,6 +58,19 @@ import { SharedMockupView } from './components/SharedMockupView';
 import { SiteMockupView } from './components/SiteMockupView';
 import { FirestoreErrorBoundary } from './components/FirestoreErrorBoundary';
 import { AiDeskView } from './components/AiDeskView';
+import type { DriveFileItem } from './services/googleDriveService';
+import type { GoogleTaskItem } from './services/googleTasksService';
+import {
+  deleteBriefingArchiveFromFirestore,
+  deleteNotebookSourceFromFirestore,
+  subscribeToBriefingArchives,
+  subscribeToNotebookSources,
+  subscribeToWorkspaceLinks,
+  updateBriefingPlaybackInFirestore,
+  upsertBriefingArchiveToFirestore,
+  upsertNotebookSourceToFirestore,
+  upsertWorkspaceLinkToFirestore,
+} from './services/firestoreWorkspaceSync';
 import {
   MediaLabView,
   type GeneratedSessionImage,
@@ -189,6 +205,12 @@ function stripAudioForStorage(briefing: AudioBriefing): AudioBriefing {
       audioBase64: undefined,
     })),
   };
+}
+
+function isRefreshableUrlSource(article: NewsArticle): boolean {
+  if (article.driveFileId) return false;
+  const rawUrl = article.url?.trim();
+  return Boolean(rawUrl && /^https?:\/\//i.test(rawUrl));
 }
 
 export default function App() {
@@ -346,7 +368,8 @@ export default function App() {
   }));
 
   // Active briefing, archive & saved playback bookmarks
-  const { getIdToken } = useAuth();
+  const { user, getIdToken } = useAuth();
+  const verifiedOwnerId = user?.uid && user.emailVerified ? user.uid : null;
   const [archive, setArchive] = useState<AudioBriefing[]>(() =>
     loadStoredJson<AudioBriefing[]>(STORAGE_ARCHIVE_KEY, [])
   );
@@ -385,12 +408,27 @@ export default function App() {
   const [isIngesting, setIsIngesting] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [ingestError, setIngestError] = useState<string | null>(null);
+  const [isRefreshingArticles, setIsRefreshingArticles] = useState(false);
+  const [refreshArticlesStatus, setRefreshArticlesStatus] = useState<string | null>(
+    null
+  );
+  const [refreshArticlesError, setRefreshArticlesError] = useState<string | null>(null);
   const [isTagging, setIsTagging] = useState(false);
   const autoTagAttemptedIdsRef = useRef<Set<string>>(new Set());
 
-  // Notebook Sources modal, mobile drawer & Source Guide inspector
+  // Notebook Sources modal, Google Workspace modals/drawers, mobile drawer & Source Guide inspector
   const [addModalOpen, setAddModalOpen] = useState(false);
-  const [addModalTab, setAddModalTab] = useState<'upload' | 'url' | 'text'>('upload');
+  const [addModalTab, setAddModalTab] = useState<AddSourceTab>('upload');
+  const [driveModalOpen, setDriveModalOpen] = useState(false);
+  const [driveModalTab, setDriveModalTab] = useState<'browse' | 'export' | 'activity'>(
+    'browse'
+  );
+  const [tasksDrawerOpen, setTasksDrawerOpen] = useState(false);
+  const [stagedTaskIndices, setStagedTaskIndices] = useState<number[] | null>(null);
+  const [workspaceLinks, setWorkspaceLinks] = useState<WorkspaceLinkItem[]>([]);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<'local' | 'syncing' | 'synced'>(
+    'local'
+  );
   const [mobileSourcesOpen, setMobileSourcesOpen] = useState(false);
   const [inspectedTarget, setInspectedTarget] = useState<InspectedSourceTarget | null>(
     null
@@ -472,6 +510,16 @@ export default function App() {
   const chatAudioRef = useRef<HTMLAudioElement | null>(null);
   const chatAudioUrlRef = useRef<string | null>(null);
 
+  // Keep live state refs for initial Firestore cloud bootstrap without re-subscribing
+  const articlesRef = useRef<NewsArticle[]>(articles);
+  articlesRef.current = articles;
+  const archiveRef = useRef<AudioBriefing[]>(archive);
+  archiveRef.current = archive;
+  const playbackPositionsRef = useRef<Record<string, PlaybackPosition>>(playbackPositions);
+  playbackPositionsRef.current = playbackPositions;
+  const bootstrappedSourcesUidRef = useRef<string | null>(null);
+  const bootstrappedBriefingsUidRef = useRef<string | null>(null);
+
   // Persist articles, preferences, and lightweight archive metadata
   useEffect(() => {
     try {
@@ -480,6 +528,192 @@ export default function App() {
       // Ignore storage quota errors
     }
   }, [articles]);
+
+  // Real-time Firestore cloud sync for Notebook Sources, Briefing Archive + Playback, and Workspace Links
+  useEffect(() => {
+    if (!verifiedOwnerId) {
+      bootstrappedSourcesUidRef.current = null;
+      bootstrappedBriefingsUidRef.current = null;
+      setWorkspaceLinks([]);
+      setCloudSyncStatus('local');
+      return;
+    }
+
+    setCloudSyncStatus('syncing');
+
+    const unsubSources = subscribeToNotebookSources(verifiedOwnerId, (cloudSources) => {
+      if (
+        cloudSources.length === 0 &&
+        bootstrappedSourcesUidRef.current !== verifiedOwnerId
+      ) {
+        bootstrappedSourcesUidRef.current = verifiedOwnerId;
+        const seedSources = articlesRef.current;
+        if (seedSources.length > 0) {
+          void Promise.all(
+            seedSources.map((src) =>
+              upsertNotebookSourceToFirestore(verifiedOwnerId, src)
+            )
+          ).finally(() => setCloudSyncStatus('synced'));
+        } else {
+          setCloudSyncStatus('synced');
+        }
+        return;
+      }
+
+      bootstrappedSourcesUidRef.current = verifiedOwnerId;
+      setCloudSyncStatus('synced');
+      setArticles((prev) => {
+        const sig = (list: NewsArticle[]) =>
+          JSON.stringify(
+            list.map((a) => [
+              a.id,
+              a.title,
+              a.category,
+              a.summary,
+              a.content.length,
+              a.estimatedReadMinutes,
+              a.selected,
+              Boolean(a.readLater),
+              a.tags ?? [],
+              a.driveFileId ?? '',
+              a.driveWebViewLink ?? '',
+            ])
+          );
+        return sig(prev) === sig(cloudSources) ? prev : cloudSources;
+      });
+    });
+
+    const unsubBriefings = subscribeToBriefingArchives(verifiedOwnerId, (records) => {
+      if (
+        records.length === 0 &&
+        bootstrappedBriefingsUidRef.current !== verifiedOwnerId
+      ) {
+        bootstrappedBriefingsUidRef.current = verifiedOwnerId;
+        const seedArchive = archiveRef.current;
+        if (seedArchive.length > 0) {
+          void Promise.all(
+            seedArchive.map((b) =>
+              upsertBriefingArchiveToFirestore(
+                verifiedOwnerId,
+                b,
+                playbackPositionsRef.current[b.id] ?? null
+              )
+            )
+          ).finally(() => setCloudSyncStatus('synced'));
+        } else {
+          setCloudSyncStatus('synced');
+        }
+        return;
+      }
+
+      bootstrappedBriefingsUidRef.current = verifiedOwnerId;
+      setCloudSyncStatus('synced');
+
+      setArchive((prev) => {
+        const localMap = new Map(prev.map((b) => [b.id, b]));
+        const merged = records.map(({ briefing: cloudB }) => {
+          const localB = localMap.get(cloudB.id);
+          if (!localB) return cloudB;
+          return {
+            ...cloudB,
+            segments: cloudB.segments.map((seg) => {
+              const localSeg = localB.segments.find((ls) => ls.id === seg.id);
+              return localSeg?.audioBase64
+                ? {
+                    ...seg,
+                    audioBase64: localSeg.audioBase64,
+                    audioDurationSeconds:
+                      seg.audioDurationSeconds ?? localSeg.audioDurationSeconds,
+                  }
+                : seg;
+            }),
+          };
+        });
+
+        const sig = (list: AudioBriefing[]) =>
+          JSON.stringify(
+            list.map((b) => [
+              b.id,
+              b.editionTitle,
+              b.exportedDocUrl ?? '',
+              b.exportedWavUrl ?? '',
+              b.syncedTaskCount ?? 0,
+              b.segments.map((s) => [
+                s.id,
+                s.title,
+                s.coHostVoiceName ?? '',
+                Boolean(s.audioStale),
+                s.lines.length,
+              ]),
+            ])
+          );
+        return sig(prev) === sig(merged) ? prev : merged;
+      });
+
+      setActiveBriefing((prev) => {
+        if (!prev) return records[0]?.briefing ?? null;
+        const match = records.find((r) => r.briefing.id === prev.id)?.briefing;
+        if (!match) return prev;
+        const mergedActive: AudioBriefing = {
+          ...match,
+          segments: match.segments.map((seg) => {
+            const localSeg = prev.segments.find((ls) => ls.id === seg.id);
+            return localSeg?.audioBase64
+              ? {
+                  ...seg,
+                  audioBase64: localSeg.audioBase64,
+                  audioDurationSeconds:
+                    seg.audioDurationSeconds ?? localSeg.audioDurationSeconds,
+                }
+              : seg;
+          }),
+        };
+        const sameMeta =
+          prev.editionTitle === mergedActive.editionTitle &&
+          (prev.exportedDocUrl ?? '') === (mergedActive.exportedDocUrl ?? '') &&
+          (prev.exportedWavUrl ?? '') === (mergedActive.exportedWavUrl ?? '') &&
+          (prev.syncedTaskCount ?? 0) === (mergedActive.syncedTaskCount ?? 0) &&
+          JSON.stringify(
+            prev.segments.map((s) => [s.id, s.lines, s.coHostVoiceName])
+          ) ===
+            JSON.stringify(
+              mergedActive.segments.map((s) => [s.id, s.lines, s.coHostVoiceName])
+            );
+        return sameMeta ? prev : mergedActive;
+      });
+
+      setPlaybackPositions((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const { briefing: cloudB, playback } of records) {
+          if (!playback) continue;
+          const localPb = prev[cloudB.id];
+          if (!localPb || playback.updatedAt > localPb.updatedAt) {
+            next[cloudB.id] = playback;
+            changed = true;
+          }
+        }
+        if (changed) {
+          try {
+            localStorage.setItem(STORAGE_PLAYBACK_KEY, JSON.stringify(next));
+          } catch {
+            // Ignore storage quota errors
+          }
+        }
+        return changed ? next : prev;
+      });
+    });
+
+    const unsubLinks = subscribeToWorkspaceLinks(verifiedOwnerId, (links) => {
+      setWorkspaceLinks(links);
+    });
+
+    return () => {
+      unsubSources();
+      unsubBriefings();
+      unsubLinks();
+    };
+  }, [verifiedOwnerId]);
 
   // Automatically generate context-relevant tags for any sources missing tags
   useEffect(() => {
@@ -505,6 +739,9 @@ export default function App() {
     )
       .then((tagsById) => {
         if (cancelled) return;
+        const updatedItems = articlesRef.current
+          .filter((a) => tagsById[a.id] && tagsById[a.id].length > 0)
+          .map((a) => ({ ...a, tags: tagsById[a.id] }));
         setArticles((prev) =>
           prev.map((a) =>
             tagsById[a.id] && tagsById[a.id].length > 0
@@ -512,6 +749,11 @@ export default function App() {
               : a
           )
         );
+        if (verifiedOwnerId && updatedItems.length > 0) {
+          for (const item of updatedItems) {
+            void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
+          }
+        }
       })
       .catch(() => {
         // Silently skip auto-tag failure so UI stays responsive
@@ -523,7 +765,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [articles]);
+  }, [articles, verifiedOwnerId]);
 
   useEffect(() => {
     try {
@@ -665,10 +907,13 @@ export default function App() {
         } catch {
           // Ignore storage quota errors
         }
+        if (forceImmediate && verifiedOwnerId) {
+          void updateBriefingPlaybackInFirestore(verifiedOwnerId, briefingId, entry);
+        }
         return next;
       });
     },
-    [activeBriefing, archive]
+    [activeBriefing, archive, verifiedOwnerId]
   );
 
   // Flush playback position when tab hides or closes
@@ -873,7 +1118,7 @@ export default function App() {
   }, []);
 
   const handleOpenAddModal = useCallback(
-    (tab: 'upload' | 'url' | 'text' = 'upload') => {
+    (tab: AddSourceTab = 'upload') => {
       setIngestError(null);
       setAddModalTab(tab);
       setAddModalOpen(true);
@@ -950,6 +1195,9 @@ export default function App() {
             addedAt: new Date().toISOString(),
           });
           setArticles((prev) => [newSource, ...prev]);
+          if (verifiedOwnerId) {
+            void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
+          }
           uploadedCount++;
         }
         return uploadedCount > 0;
@@ -963,7 +1211,123 @@ export default function App() {
         setUploadStatus(null);
       }
     },
-    [readFileAsBase64]
+    [readFileAsBase64, verifiedOwnerId]
+  );
+
+  // Import Google Docs & Drive files while preserving Drive provenance and syncing to Firestore
+  const handleImportDriveItems = useCallback(
+    async (
+      items: Array<{ file: File; driveItem: DriveFileItem }>
+    ): Promise<boolean> => {
+      if (items.length === 0) return false;
+
+      const MAX_BYTES = 15 * 1024 * 1024;
+      setIngestError(null);
+      setIsIngesting(true);
+
+      let importedCount = 0;
+      let firstTitle = '';
+
+      try {
+        for (let i = 0; i < items.length; i++) {
+          const { file, driveItem } = items[i];
+          const lower = file.name.toLowerCase();
+          const isPdf = lower.endsWith('.pdf') || file.type === 'application/pdf';
+          const isDocx =
+            lower.endsWith('.docx') ||
+            file.type ===
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+          const isMd =
+            lower.endsWith('.md') ||
+            lower.endsWith('.markdown') ||
+            file.type === 'text/markdown';
+
+          if (file.size > MAX_BYTES) {
+            throw new Error(`"${file.name}" exceeds the 15 MB limit.`);
+          }
+
+          setUploadStatus(
+            `Indexing "${driveItem.name}" from Google Drive (${i + 1} of ${items.length})...`
+          );
+
+          let extracted: Omit<NewsArticle, 'id' | 'selected' | 'addedAt'>;
+          if (isPdf || isDocx) {
+            const base64Data = await readFileAsBase64(file);
+            extracted = await uploadDocumentSource({
+              fileName: file.name,
+              mimeType:
+                file.type ||
+                (isPdf
+                  ? 'application/pdf'
+                  : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+              base64Data,
+              fileSizeBytes: file.size,
+            });
+          } else {
+            const textContent = await file.text();
+            extracted = await uploadDocumentSource({
+              fileName: file.name,
+              mimeType: file.type || (isMd ? 'text/markdown' : 'text/plain'),
+              textContent,
+              fileSizeBytes: file.size,
+            });
+          }
+
+          const isGoogleDoc =
+            driveItem.mimeType === 'application/vnd.google-apps.document';
+          const newSource = ensureArticlePassages({
+            ...extracted,
+            id: `drv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            source: isGoogleDoc ? 'Google Docs' : extracted.source || 'Google Drive',
+            url: driveItem.webViewLink || extracted.url,
+            driveFileId: driveItem.id,
+            driveWebViewLink: driveItem.webViewLink,
+            driveMimeType: driveItem.mimeType,
+            selected: true,
+            addedAt: new Date().toISOString(),
+          });
+
+          if (!firstTitle) firstTitle = newSource.title;
+          setArticles((prev) => [newSource, ...prev]);
+
+          if (verifiedOwnerId) {
+            void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
+            void upsertWorkspaceLinkToFirestore(verifiedOwnerId, {
+              kind: 'drive_source',
+              externalId: driveItem.id,
+              title: newSource.title,
+              url: driveItem.webViewLink,
+              sourceId: newSource.id,
+            });
+          }
+          importedCount++;
+        }
+
+        if (importedCount > 0) {
+          showTransferToast({
+            target: 'notebook',
+            title:
+              importedCount === 1
+                ? 'Imported from Google Drive'
+                : `Imported ${importedCount} Drive Documents`,
+            description:
+              'Indexed passages for clickable citations and synced to your workspace.',
+            label: firstTitle || 'Google Drive Source',
+          });
+        }
+
+        return importedCount > 0;
+      } catch (err) {
+        setIngestError(
+          err instanceof Error ? err.message : 'Failed to import from Google Drive.'
+        );
+        return importedCount > 0;
+      } finally {
+        setIsIngesting(false);
+        setUploadStatus(null);
+      }
+    },
+    [readFileAsBase64, showTransferToast, verifiedOwnerId]
   );
 
   // Article URL / pasted text ingestion
@@ -983,6 +1347,9 @@ export default function App() {
           addedAt: new Date().toISOString(),
         });
         setArticles((prev) => [newArticle, ...prev]);
+        if (verifiedOwnerId) {
+          void upsertNotebookSourceToFirestore(verifiedOwnerId, newArticle);
+        }
         return true;
       } catch (err) {
         setIngestError(
@@ -994,37 +1361,109 @@ export default function App() {
         setUploadStatus(null);
       }
     },
-    []
+    [verifiedOwnerId]
   );
 
-  const handleToggleArticle = useCallback((id: string) => {
-    setArticles((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, selected: !a.selected } : a))
-    );
-  }, []);
+  const handleToggleArticle = useCallback(
+    (id: string) => {
+      const existing = articlesRef.current.find((a) => a.id === id);
+      const updatedItem = existing ? { ...existing, selected: !existing.selected } : null;
+      setArticles((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, selected: !a.selected } : a))
+      );
+      if (verifiedOwnerId && updatedItem) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, updatedItem);
+      }
+    },
+    [verifiedOwnerId]
+  );
 
-  const handleToggleAll = useCallback((selected: boolean) => {
-    setArticles((prev) =>
-      prev.map((a) => (a.readLater ? a : { ...a, selected }))
-    );
-  }, []);
+  const handleToggleAll = useCallback(
+    (selected: boolean) => {
+      const changed = articlesRef.current
+        .filter((a) => !a.readLater)
+        .map((a) => ({ ...a, selected }));
+      setArticles((prev) =>
+        prev.map((a) => (a.readLater ? a : { ...a, selected }))
+      );
+      if (verifiedOwnerId && changed.length > 0) {
+        for (const item of changed) {
+          void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
+        }
+      }
+    },
+    [verifiedOwnerId]
+  );
 
-  const handleToggleReadLater = useCallback((id: string) => {
-    setArticles((prev) =>
-      prev.map((a) => {
-        if (a.id !== id) return a;
-        const movingToReadLater = !a.readLater;
-        return {
-          ...a,
-          readLater: movingToReadLater,
-          selected: movingToReadLater ? false : true,
-          shelvedAt: movingToReadLater ? new Date().toISOString() : undefined,
-        };
-      })
-    );
-  }, []);
+  const handleBulkToggleCategory = useCallback(
+    (category: string, selected: boolean) => {
+      const targetKey = (category.trim() || 'General').toLowerCase();
+      const changed: NewsArticle[] = [];
+      const nextArticles = articlesRef.current.map((a) => {
+        if (a.readLater) return a;
+        const articleKey = ((a.category || '').trim() || 'General').toLowerCase();
+        if (articleKey !== targetKey || a.selected === selected) {
+          return a;
+        }
+        const updated = { ...a, selected };
+        changed.push(updated);
+        return updated;
+      });
+
+      if (changed.length === 0) return;
+
+      articlesRef.current = nextArticles;
+      setArticles(nextArticles);
+
+      if (verifiedOwnerId) {
+        for (const item of changed) {
+          void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
+        }
+      }
+    },
+    [verifiedOwnerId]
+  );
+
+  const handleToggleReadLater = useCallback(
+    (id: string) => {
+      const existing = articlesRef.current.find((a) => a.id === id);
+      const nowIso = new Date().toISOString();
+      const updatedItem = existing
+        ? {
+            ...existing,
+            readLater: !existing.readLater,
+            selected: !existing.readLater ? false : true,
+            shelvedAt: !existing.readLater ? nowIso : undefined,
+          }
+        : null;
+      setArticles((prev) =>
+        prev.map((a) => {
+          if (a.id !== id) return a;
+          const movingToReadLater = !a.readLater;
+          return {
+            ...a,
+            readLater: movingToReadLater,
+            selected: movingToReadLater ? false : true,
+            shelvedAt: movingToReadLater ? nowIso : undefined,
+          };
+        })
+      );
+      if (verifiedOwnerId && updatedItem) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, updatedItem);
+      }
+    },
+    [verifiedOwnerId]
+  );
 
   const handleRestoreAllReadLater = useCallback(() => {
+    const restored = articlesRef.current
+      .filter((a) => Boolean(a.readLater))
+      .map((a) => ({
+        ...a,
+        readLater: false,
+        selected: true,
+        shelvedAt: undefined,
+      }));
     setArticles((prev) =>
       prev.map((a) =>
         a.readLater
@@ -1032,58 +1471,212 @@ export default function App() {
           : a
       )
     );
-  }, []);
+    if (verifiedOwnerId && restored.length > 0) {
+      for (const item of restored) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
+      }
+    }
+  }, [verifiedOwnerId]);
 
-  const handleRemoveArticle = useCallback((id: string) => {
-    setArticles((prev) => prev.filter((a) => a.id !== id));
-    setInspectedTarget((prev) => (prev?.sourceId === id ? null : prev));
-  }, []);
+  const handleRemoveArticle = useCallback(
+    (id: string) => {
+      setArticles((prev) => prev.filter((a) => a.id !== id));
+      setInspectedTarget((prev) => (prev?.sourceId === id ? null : prev));
+      if (verifiedOwnerId) {
+        void deleteNotebookSourceFromFirestore(verifiedOwnerId, id);
+      }
+    },
+    [verifiedOwnerId]
+  );
 
   const handleResetSamples = useCallback(() => {
     setIngestError(null);
     const sampleIds = new Set(SAMPLE_ARTICLES.map((s) => s.id));
+    const freshSamples = SAMPLE_ARTICLES.map((a) =>
+      ensureArticlePassages({
+        ...a,
+        selected: true,
+        readLater: false,
+        shelvedAt: undefined,
+      })
+    );
+    const removedIds = articlesRef.current
+      .filter((a) => !a.readLater && !sampleIds.has(a.id))
+      .map((a) => a.id);
     setArticles((prev) => {
       const keptReadLater = prev.filter(
-        (a) => a.readLater && !sampleIds.has(a.id)
-      );
-      const freshSamples = SAMPLE_ARTICLES.map((a) =>
-        ensureArticlePassages({
-          ...a,
-          selected: true,
-          readLater: false,
-          shelvedAt: undefined,
-        })
+        (a) => Boolean(a.readLater) && !sampleIds.has(a.id)
       );
       return [...freshSamples, ...keptReadLater];
     });
-  }, []);
+    if (verifiedOwnerId) {
+      for (const id of removedIds) {
+        void deleteNotebookSourceFromFirestore(verifiedOwnerId, id);
+      }
+      for (const sample of freshSamples) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, sample);
+      }
+    }
+  }, [verifiedOwnerId]);
+
+  const runAutoTagForSources = useCallback(
+    async (targetSources?: NewsArticle[]) => {
+      const sourceList = Array.isArray(targetSources)
+        ? targetSources
+        : articlesRef.current;
+      if (sourceList.length === 0) return;
+
+      sourceList.forEach((a) => autoTagAttemptedIdsRef.current.add(a.id));
+      setIsTagging(true);
+      try {
+        const mergedTagsById: Record<string, string[]> = {};
+        for (let offset = 0; offset < sourceList.length; offset += 20) {
+          const batch = sourceList.slice(offset, offset + 20);
+          const batchTags = await generateSourceTags(
+            batch.map((a) => ({
+              id: a.id,
+              title: a.title,
+              summary: a.summary,
+              content: a.content,
+              category: a.category,
+            }))
+          );
+          Object.assign(mergedTagsById, batchTags);
+        }
+
+        const nextArticles = articlesRef.current.map((a) =>
+          mergedTagsById[a.id] && mergedTagsById[a.id].length > 0
+            ? { ...a, tags: mergedTagsById[a.id] }
+            : a
+        );
+        const updatedItems = nextArticles.filter(
+          (a) => mergedTagsById[a.id] && mergedTagsById[a.id].length > 0
+        );
+
+        articlesRef.current = nextArticles;
+        setArticles(nextArticles);
+
+        if (verifiedOwnerId && updatedItems.length > 0) {
+          for (const item of updatedItems) {
+            void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
+          }
+        }
+      } catch {
+        // Non-fatal: keep existing tags intact
+      } finally {
+        setIsTagging(false);
+      }
+    },
+    [verifiedOwnerId]
+  );
 
   const handleAutoTagSources = useCallback(async () => {
-    if (articles.length === 0 || isTagging) return;
-    setIsTagging(true);
+    if (articlesRef.current.length === 0 || isTagging) return;
+    await runAutoTagForSources(articlesRef.current);
+  }, [isTagging, runAutoTagForSources]);
+
+  const handleRefreshAllArticles = useCallback(async () => {
+    if (isRefreshingArticles || isIngesting) return;
+    const snapshot = articlesRef.current;
+    if (snapshot.length === 0) return;
+
+    const urlSources = snapshot.filter(isRefreshableUrlSource);
+    setRefreshArticlesError(null);
+    setIsRefreshingArticles(true);
+
+    let workingArticles = [...snapshot];
+    let refreshedCount = 0;
+    const failedTitles: string[] = [];
+
     try {
-      const tagsById = await generateSourceTags(
-        articles.map((a) => ({
-          id: a.id,
-          title: a.title,
-          summary: a.summary,
-          content: a.content,
-          category: a.category,
-        }))
-      );
-      setArticles((prev) =>
-        prev.map((a) =>
-          tagsById[a.id] && tagsById[a.id].length > 0
-            ? { ...a, tags: tagsById[a.id] }
-            : a
-        )
-      );
-    } catch {
-      // Non-fatal: keep existing tags intact
+      for (let i = 0; i < urlSources.length; i++) {
+        const target = urlSources[i];
+        const targetUrl = target.url!.trim();
+        setRefreshArticlesStatus(
+          `Refreshing URL ${i + 1} of ${urlSources.length}: ${target.title}`
+        );
+
+        try {
+          const extracted = await ingestArticle({ url: targetUrl });
+          autoTagAttemptedIdsRef.current.add(target.id);
+
+          const updatedArticle = ensureArticlePassages({
+            ...target,
+            ...extracted,
+            id: target.id,
+            url: extracted.url || targetUrl,
+            selected: target.selected,
+            readLater: target.readLater,
+            shelvedAt: target.shelvedAt,
+            addedAt: target.addedAt,
+            imageUrl: extracted.imageUrl || target.imageUrl,
+            tags:
+              extracted.tags && extracted.tags.length > 0
+                ? extracted.tags
+                : target.tags,
+            passages: undefined,
+          });
+
+          workingArticles = workingArticles.map((item) =>
+            item.id === target.id ? updatedArticle : item
+          );
+          articlesRef.current = workingArticles;
+          setArticles(workingArticles);
+
+          if (verifiedOwnerId) {
+            void upsertNotebookSourceToFirestore(verifiedOwnerId, updatedArticle);
+          }
+          refreshedCount++;
+        } catch {
+          failedTitles.push(target.title);
+        }
+      }
+
+      setRefreshArticlesStatus('Regenerating automatic topic tags...');
+      workingArticles.forEach((a) => autoTagAttemptedIdsRef.current.delete(a.id));
+      await runAutoTagForSources(workingArticles);
+
+      if (failedTitles.length > 0) {
+        setRefreshArticlesError(
+          `Updated ${refreshedCount} of ${urlSources.length} URL ${
+            urlSources.length === 1 ? 'source' : 'sources'
+          }. Could not refresh: ${failedTitles.slice(0, 2).join(', ')}${
+            failedTitles.length > 2 ? ` (+${failedTitles.length - 2} more)` : ''
+          }.`
+        );
+      } else if (urlSources.length > 0) {
+        showTransferToast({
+          target: 'notebook',
+          title:
+            refreshedCount === 1
+              ? 'Refreshed 1 Article & Updated Tags'
+              : `Refreshed ${refreshedCount} Articles & Updated Tags`,
+          description:
+            'Re-fetched URL content, re-indexed passages, and regenerated newsroom topic tags.',
+          label: urlSources[0]?.title || 'Notebook Sources',
+        });
+      } else {
+        showTransferToast({
+          target: 'notebook',
+          title: 'Topic Tags Regenerated',
+          description:
+            'No external article URLs were queued to re-fetch; refreshed automatic tags across your current sources.',
+          label: `${workingArticles.length} ${
+            workingArticles.length === 1 ? 'source' : 'sources'
+          } tagged`,
+        });
+      }
     } finally {
-      setIsTagging(false);
+      setIsRefreshingArticles(false);
+      setRefreshArticlesStatus(null);
     }
-  }, [articles, isTagging]);
+  }, [
+    isIngesting,
+    isRefreshingArticles,
+    runAutoTagForSources,
+    showTransferToast,
+    verifiedOwnerId,
+  ]);
 
   const handleInspectSource = useCallback((sourceId: string) => {
     setInspectedTarget({ sourceId });
@@ -1097,17 +1690,27 @@ export default function App() {
     });
   }, []);
 
-  // Helper to update both activeBriefing and archive
-  const commitBriefingUpdate = useCallback((updated: AudioBriefing) => {
-    setActiveBriefing(updated);
-    setArchive((prev) => {
-      const exists = prev.some((b) => b.id === updated.id);
-      if (exists) {
-        return prev.map((b) => (b.id === updated.id ? updated : b));
+  // Helper to update both activeBriefing, archive, and Firestore cloud sync
+  const commitBriefingUpdate = useCallback(
+    (updated: AudioBriefing) => {
+      setActiveBriefing(updated);
+      setArchive((prev) => {
+        const exists = prev.some((b) => b.id === updated.id);
+        if (exists) {
+          return prev.map((b) => (b.id === updated.id ? updated : b));
+        }
+        return [updated, ...prev];
+      });
+      if (verifiedOwnerId) {
+        void upsertBriefingArchiveToFirestore(
+          verifiedOwnerId,
+          updated,
+          playbackPositionsRef.current[updated.id] ?? null
+        );
       }
-      return [updated, ...prev];
-    });
-  }, []);
+    },
+    [verifiedOwnerId]
+  );
 
   // Synthesize audio for a single chapter using gemini-3.8-flash-tts
   const synthesizeOneSegment = useCallback(
@@ -1712,15 +2315,20 @@ export default function App() {
     sleepTimerMode,
   ]);
 
-  // Download full stitched WAV episode
-  const handleDownloadFullWav = useCallback(() => {
-    if (!activeBriefing) return;
+  // Build stitched WAV Blob from recorded briefing chapters
+  const handleBuildStitchedWavBlob = useCallback((): Blob | null => {
+    if (!activeBriefing) return null;
     const clips = activeBriefing.segments
       .map((s) => s.audioBase64)
       .filter((b): b is string => Boolean(b));
-    if (clips.length === 0) return;
+    if (clips.length === 0) return null;
+    return stitchWavBase64Clips(clips);
+  }, [activeBriefing]);
 
-    const wavBlob = stitchWavBase64Clips(clips);
+  // Download full stitched WAV episode
+  const handleDownloadFullWav = useCallback(() => {
+    if (!activeBriefing) return;
+    const wavBlob = handleBuildStitchedWavBlob();
     if (!wavBlob) return;
 
     const safeSlug = activeBriefing.editionTitle
@@ -1737,7 +2345,107 @@ export default function App() {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-  }, [activeBriefing]);
+  }, [activeBriefing, handleBuildStitchedWavBlob]);
+
+  // Persist exported Google Doc / WAV metadata onto briefing & Firestore workspaceLinks
+  const handleExportedBriefingAsset = useCallback(
+    ({
+      briefingId,
+      kind,
+      driveItem,
+    }: {
+      briefingId: string;
+      kind: 'doc' | 'wav';
+      driveItem: DriveFileItem;
+    }) => {
+      const target =
+        (activeBriefing?.id === briefingId ? activeBriefing : null) ||
+        archive.find((b) => b.id === briefingId);
+
+      if (target) {
+        const updated: AudioBriefing =
+          kind === 'doc'
+            ? {
+                ...target,
+                exportedDocId: driveItem.id,
+                exportedDocUrl: driveItem.webViewLink || target.exportedDocUrl,
+              }
+            : {
+                ...target,
+                exportedWavFileId: driveItem.id,
+                exportedWavUrl: driveItem.webViewLink || target.exportedWavUrl,
+              };
+        commitBriefingUpdate(updated);
+      }
+
+      if (verifiedOwnerId) {
+        void upsertWorkspaceLinkToFirestore(verifiedOwnerId, {
+          kind: kind === 'doc' ? 'google_doc_export' : 'drive_wav_export',
+          externalId: driveItem.id,
+          title: driveItem.name,
+          url: driveItem.webViewLink,
+          briefingId,
+        });
+      }
+
+      showTransferToast({
+        target: 'notebook',
+        title:
+          kind === 'doc'
+            ? 'Saved Formatted Google Doc'
+            : 'Saved WAV Episode to Google Drive',
+        description:
+          kind === 'doc'
+            ? 'Created structured Google Doc in Drive and linked to this edition.'
+            : 'Uploaded stitched WAV episode to Drive and linked to this edition.',
+        label: driveItem.name,
+      });
+    },
+    [activeBriefing, archive, commitBriefingUpdate, showTransferToast, verifiedOwnerId]
+  );
+
+  // Record created Google Tasks against briefing & Firestore workspaceLinks
+  const handleTasksCreatedFromBriefing = useCallback(
+    (createdTasks: GoogleTaskItem[], briefingId?: string) => {
+      if (createdTasks.length === 0) return;
+
+      if (briefingId) {
+        const target =
+          (activeBriefing?.id === briefingId ? activeBriefing : null) ||
+          archive.find((b) => b.id === briefingId);
+        if (target) {
+          const updated: AudioBriefing = {
+            ...target,
+            syncedTaskCount: (target.syncedTaskCount ?? 0) + createdTasks.length,
+          };
+          commitBriefingUpdate(updated);
+        }
+      }
+
+      if (verifiedOwnerId) {
+        for (const task of createdTasks) {
+          void upsertWorkspaceLinkToFirestore(verifiedOwnerId, {
+            kind: 'google_task',
+            externalId: task.id,
+            title: task.title,
+            url: task.webViewLink || 'https://tasks.google.com',
+            briefingId,
+          });
+        }
+      }
+
+      showTransferToast({
+        target: 'notebook',
+        title:
+          createdTasks.length === 1
+            ? 'Added Takeaway to Google Tasks'
+            : `Added ${createdTasks.length} Takeaways to Google Tasks`,
+        description: 'Synced follow-up items with cited briefing notes to Google Tasks.',
+        label: createdTasks[0].title,
+      });
+    },
+    [activeBriefing, archive, commitBriefingUpdate, showTransferToast, verifiedOwnerId]
+  );
 
   // Multi-turn Editor Chat handlers
   const handleSendChatMessage = useCallback(
@@ -1940,8 +2648,11 @@ export default function App() {
         setCurrentTime(0);
         setDuration(0);
       }
+      if (verifiedOwnerId) {
+        void deleteBriefingArchiveFromFirestore(verifiedOwnerId, id);
+      }
     },
-    [activeBriefing]
+    [activeBriefing, verifiedOwnerId]
   );
 
   const hasReadyAudio = Boolean(
@@ -2385,6 +3096,9 @@ export default function App() {
       });
 
       setArticles((prev) => [newSource, ...prev]);
+      if (verifiedOwnerId) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
+      }
       showTransferToast({
         target: 'notebook',
         title: 'Added to Newsroom Sources',
@@ -2397,7 +3111,7 @@ export default function App() {
         },
       });
     },
-    [showTransferToast, dismissTransferToast]
+    [showTransferToast, dismissTransferToast, verifiedOwnerId]
   );
 
   const [isSpatialImmersive, setIsSpatialImmersive] = useState(() =>
@@ -2458,7 +3172,18 @@ export default function App() {
       }`}
     >
       {!hideChromeForSpatialImmersive && (
-        <TopBar activeView={activeView} onSelectView={setActiveView} />
+        <TopBar
+          activeView={activeView}
+          onSelectView={setActiveView}
+          onOpenGoogleDrive={() => {
+            setDriveModalTab(activeView === 'briefing' ? 'export' : 'browse');
+            setDriveModalOpen(true);
+          }}
+          onOpenGoogleTasks={() => {
+            setStagedTaskIndices(null);
+            setTasksDrawerOpen(true);
+          }}
+        />
       )}
 
       {/* Google Maps Platform Demo Key Quota Banner (Section 8 Case A) */}
@@ -2545,14 +3270,54 @@ export default function App() {
             })}
           </div>
 
-          <button
-            type="button"
-            disabled={isGenerating || isSynthesizingAll}
-            onClick={handleTopBarPrimaryAction}
-            className="h-9 px-3.5 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] disabled:opacity-45 disabled:cursor-not-allowed rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            {newsroomCtaLabel}
-          </button>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            {verifiedOwnerId && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 text-xs font-mono text-[#8C96A8] tabular-nums whitespace-nowrap mr-1">
+                <span className="text-[#67E8F9]">
+                  {cloudSyncStatus === 'syncing' ? 'Syncing...' : 'Cloud Synced'}
+                </span>
+                {workspaceLinks.length > 0 && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>{workspaceLinks.length} linked</span>
+                  </>
+                )}
+              </span>
+            )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setDriveModalTab(activeView === 'briefing' ? 'export' : 'browse');
+                setDriveModalOpen(true);
+              }}
+              className="h-9 px-3 inline-flex items-center gap-1.5 text-xs font-medium text-[#E4E9F1] hover:text-[#67E8F9] bg-[#13161C] hover:bg-[#19202B] border border-[#273040] hover:border-[#22D3EE]/55 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <HardDrive className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+              Drive &amp; Docs
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setStagedTaskIndices(null);
+                setTasksDrawerOpen(true);
+              }}
+              className="h-9 px-3 inline-flex items-center gap-1.5 text-xs font-medium text-[#E4E9F1] hover:text-[#67E8F9] bg-[#13161C] hover:bg-[#19202B] border border-[#273040] hover:border-[#22D3EE]/55 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <ListChecks className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+              Google Tasks
+            </button>
+
+            <button
+              type="button"
+              disabled={isGenerating || isSynthesizingAll}
+              onClick={handleTopBarPrimaryAction}
+              className="h-9 px-3.5 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] disabled:opacity-45 disabled:cursor-not-allowed rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {newsroomCtaLabel}
+            </button>
+          </div>
         </div>
       )}
 
@@ -2588,6 +3353,8 @@ export default function App() {
             isUploading={isIngesting}
             uploadStatus={uploadStatus}
             isTagging={isTagging}
+            isRefreshingArticles={isRefreshingArticles}
+            refreshArticlesStatus={refreshArticlesStatus}
             mobileOpen={mobileSourcesOpen}
             onCloseMobile={() => setMobileSourcesOpen(false)}
             onOpenAddModal={handleOpenAddModal}
@@ -2602,6 +3369,7 @@ export default function App() {
             onRemoveSource={handleRemoveArticle}
             onResetSamples={handleResetSamples}
             onAutoTagSources={handleAutoTagSources}
+            onRefreshAllArticles={handleRefreshAllArticles}
           />
         )}
 
@@ -2620,10 +3388,16 @@ export default function App() {
                 onInspectSource={handleInspectSource}
                 onToggleArticle={handleToggleArticle}
                 onToggleAll={handleToggleAll}
+                onBulkToggleCategory={handleBulkToggleCategory}
                 onToggleReadLater={handleToggleReadLater}
                 onRestoreAllReadLater={handleRestoreAllReadLater}
                 onRemoveArticle={handleRemoveArticle}
                 onResetSamples={handleResetSamples}
+                onRefreshAllArticles={handleRefreshAllArticles}
+                isRefreshingArticles={isRefreshingArticles}
+                refreshArticlesStatus={refreshArticlesStatus}
+                refreshArticlesError={refreshArticlesError}
+                onDismissRefreshError={() => setRefreshArticlesError(null)}
                 onBuildBriefing={handleBuildBriefing}
                 isGenerating={isGenerating || isSynthesizingAll}
                 generationStatus={generationStatus}
@@ -2679,6 +3453,14 @@ export default function App() {
                 onOpenCommuteMode={() => setCommuteModeOpen(true)}
                 onPreviewShare={handleOpenSharedPreview}
                 onProjectBriefingTo3D={handleProjectBriefingTo3DFoil}
+                onOpenDriveExport={() => {
+                  setDriveModalTab('export');
+                  setDriveModalOpen(true);
+                }}
+                onSendTakeawaysToTasks={(indices) => {
+                  setStagedTaskIndices(indices ?? []);
+                  setTasksDrawerOpen(true);
+                }}
               />
             </FirestoreErrorBoundary>
           )}
@@ -2817,7 +3599,7 @@ export default function App() {
         onToggleReadLater={handleToggleReadLater}
       />
 
-      {/* Add Source Modal (Upload PDF/DOCX/TXT/MD, Article URL, or Paste Text) */}
+      {/* Add Source Modal (Upload PDF/DOCX/TXT/MD, Google Drive, Article URL, or Paste Text) */}
       <AddSourceModal
         open={addModalOpen}
         initialTab={addModalTab}
@@ -2831,8 +3613,44 @@ export default function App() {
           }
         }}
         onUploadFiles={handleUploadFiles}
+        onImportDriveItems={handleImportDriveItems}
         onIngestUrlOrText={handleIngestArticle}
       />
+
+      {/* Google Drive & Formatted Google Docs Workspace Modal */}
+      <FirestoreErrorBoundary
+        resetKey={driveModalOpen ? 'drive-open' : 'drive-closed'}
+        title="Google Drive Workspace encountered an error"
+      >
+        <GoogleDriveModal
+          open={driveModalOpen}
+          initialTab={driveModalTab}
+          briefing={activeBriefing}
+          onBuildStitchedWavBlob={handleBuildStitchedWavBlob}
+          onImportFilesToSources={handleUploadFiles}
+          onImportDriveItems={handleImportDriveItems}
+          onExportedBriefingAsset={handleExportedBriefingAsset}
+          onClose={() => setDriveModalOpen(false)}
+        />
+      </FirestoreErrorBoundary>
+
+      {/* Google Tasks Slide-Over Drawer */}
+      <FirestoreErrorBoundary
+        resetKey={tasksDrawerOpen ? 'tasks-open' : 'tasks-closed'}
+        title="Google Tasks encountered an error"
+      >
+        <GoogleTasksDrawer
+          open={tasksDrawerOpen}
+          briefing={activeBriefing}
+          stagedTakeawayIndices={stagedTaskIndices}
+          onClearStagedTakeaways={() => setStagedTaskIndices(null)}
+          onTasksCreated={handleTasksCreatedFromBriefing}
+          onClose={() => {
+            setTasksDrawerOpen(false);
+            setStagedTaskIndices(null);
+          }}
+        />
+      </FirestoreErrorBoundary>
 
       {/* Persistent Audio Player Bar */}
       {!hideChromeForSpatialImmersive && activeBriefing && hasReadyAudio && (
