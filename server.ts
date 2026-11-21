@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'path';
@@ -31,9 +32,15 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DIST_DIR = path.resolve(__dirname, 'dist');
+const HAS_BUILT_CLIENT = fsSync.existsSync(path.join(DIST_DIR, 'index.html'));
+const IS_DEV_SCRIPT = process.env.npm_lifecycle_event === 'dev';
 
 const PORT = Number(process.env.PORT) || 3000;
-const isProd = process.env.NODE_ENV === 'production';
+const isProd =
+  process.env.NODE_ENV === 'production' ||
+  process.env.npm_lifecycle_event === 'start' ||
+  (!IS_DEV_SCRIPT && process.env.NODE_ENV !== 'development' && HAS_BUILT_CLIENT);
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -562,9 +569,13 @@ async function readValidShareManifest(shareId: string): Promise<
   }
 }
 
-// Health check
+// Health checks (Cloud Run startup & liveness probes)
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+  res.status(200).json({ ok: true });
+});
+
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true });
 });
 
 // 1A. Upload & ingest a user document (PDF, DOCX, TXT, Markdown)
@@ -3995,29 +4006,47 @@ registerRssRoutes(app, {
 });
 
 async function startServer() {
-  cleanupExpiredShares().catch(() => {});
-  cleanupExpiredMockupShares().catch(() => {});
-  if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
   const httpServer = http.createServer(app);
   attachLiveVoiceServer(httpServer, getGeminiClient);
 
+  httpServer.on('error', (err) => {
+    console.error(`HTTP server failed on port ${PORT}:`, err);
+    process.exit(1);
+  });
+
+  if (isProd) {
+    app.use(express.static(DIST_DIR));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(DIST_DIR, 'index.html'));
+    });
+
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      console.log(`Dispatch server listening on http://0.0.0.0:${PORT} (production)`);
+      setImmediate(() => {
+        cleanupExpiredShares().catch(() => {});
+        cleanupExpiredMockupShares().catch(() => {});
+      });
+    });
+    return;
+  }
+
+  const { createServer: createViteServer } = await import('vite');
+  const vite = await createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa',
+  });
+  app.use(vite.middlewares);
+
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Dispatch server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Dispatch server listening on http://0.0.0.0:${PORT} (development)`);
+    setImmediate(() => {
+      cleanupExpiredShares().catch(() => {});
+      cleanupExpiredMockupShares().catch(() => {});
+    });
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Fatal server startup error:', err);
+  process.exit(1);
+});

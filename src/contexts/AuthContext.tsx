@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from 'react';
 import {
+  GoogleAuthProvider,
   onAuthStateChanged,
   reload,
   signInWithPopup,
@@ -27,6 +28,10 @@ import { syncCallerFirestoreProfile } from '../services/firestoreUserProfile';
 
 const PRINCIPAL_OWNER_EMAIL = 'mcollier2188@gmail.com';
 
+// Strictly in-memory Google Workspace OAuth access token cache (never stored in localStorage/sessionStorage)
+let cachedDriveAccessToken: string | null = null;
+let isSigningInWithGoogle = false;
+
 function formatFirebaseAuthError(err: unknown): string {
   const code =
     err && typeof err === 'object' && 'code' in err
@@ -41,7 +46,11 @@ function formatFirebaseAuthError(err: unknown): string {
     return 'Google Sign-In window was closed before completing verification. Click Retry Sign-In whenever you are ready.';
   }
   if (code === 'auth/unauthorized-domain') {
-    return 'This preview domain is not yet listed in Firebase Authorized Domains. Open the app in a standalone browser tab or check Firebase Authentication settings.';
+    const currentDomain =
+      typeof window !== 'undefined' && window.location?.hostname
+        ? window.location.hostname
+        : 'this domain';
+    return `Domain "${currentDomain}" is not yet listed in Firebase Authorized Domains. Add "${currentDomain}" in Firebase Console → Authentication → Settings → Authorized domains (project gen-lang-client-0938852670), then click Retry Sign-In.`;
   }
   if (code === 'auth/network-request-failed') {
     return 'Network connection interrupted during Google Sign-In. Check your connection and retry.';
@@ -57,6 +66,7 @@ interface AuthContextValue {
   isAdminOrOwner: boolean;
   isLoading: boolean;
   authError: string | null;
+  driveAccessToken: string | null;
   clearAuthError: () => void;
   refreshProfileRole: () => Promise<void>;
   repairCurrentAuthSession: () => Promise<{
@@ -65,6 +75,9 @@ interface AuthContextValue {
     role: UserRole;
   }>;
   signInWithGoogle: () => Promise<void>;
+  connectGoogleDrive: () => Promise<string | null>;
+  getDriveAccessToken: () => string | null;
+  invalidateDriveAccessToken: () => void;
   signOutUser: () => Promise<void>;
   getIdToken: () => Promise<string | null>;
 }
@@ -77,10 +90,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [accountStatus, setAccountStatus] = useState<'active' | 'suspended'>('active');
   const [isLoading, setIsLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [driveAccessToken, setDriveAccessToken] = useState<string | null>(
+    () => cachedDriveAccessToken
+  );
   const tokenRef = useRef<string | null>(null);
 
   const handleForcedSessionRevocation = useCallback(async (reasonMessage?: string) => {
     tokenRef.current = null;
+    cachedDriveAccessToken = null;
+    setDriveAccessToken(null);
     setRole('member');
     setAccountStatus('active');
     setAuthError(
@@ -153,6 +171,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(nextUser);
       if (nextUser) {
         setAuthError(null);
+        if (cachedDriveAccessToken) {
+          setDriveAccessToken(cachedDriveAccessToken);
+        } else if (!isSigningInWithGoogle) {
+          cachedDriveAccessToken = null;
+          setDriveAccessToken(null);
+        }
         try {
           const freshToken = await nextUser.getIdToken();
           tokenRef.current = freshToken;
@@ -168,6 +192,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       } else {
         tokenRef.current = null;
+        cachedDriveAccessToken = null;
+        setDriveAccessToken(null);
         setRole('member');
         setAccountStatus('active');
       }
@@ -178,6 +204,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const clearAuthError = useCallback(() => {
     setAuthError(null);
+  }, []);
+
+  const getDriveAccessToken = useCallback(() => {
+    return cachedDriveAccessToken;
+  }, []);
+
+  const invalidateDriveAccessToken = useCallback(() => {
+    cachedDriveAccessToken = null;
+    setDriveAccessToken(null);
   }, []);
 
   const getIdToken = useCallback(async () => {
@@ -319,17 +354,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const signInWithGoogle = useCallback(async () => {
+  const connectGoogleDrive = useCallback(async (): Promise<string | null> => {
     setAuthError(null);
+    isSigningInWithGoogle = true;
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
+      const oauthCred = GoogleAuthProvider.credentialFromResult(cred);
+      const accessToken = oauthCred?.accessToken ?? null;
+      cachedDriveAccessToken = accessToken;
+      setDriveAccessToken(accessToken);
+
       const freshToken = await cred.user.getIdToken();
       tokenRef.current = freshToken;
       await syncRoleFromBackend(cred.user, freshToken, true);
+      return accessToken;
     } catch (err) {
       setAuthError(formatFirebaseAuthError(err));
+      return null;
+    } finally {
+      isSigningInWithGoogle = false;
     }
   }, [syncRoleFromBackend]);
+
+  const signInWithGoogle = useCallback(async () => {
+    await connectGoogleDrive();
+  }, [connectGoogleDrive]);
 
   const signOutUser = useCallback(async () => {
     setAuthError(null);
@@ -344,6 +393,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       await signOut(auth);
       tokenRef.current = null;
+      cachedDriveAccessToken = null;
+      setDriveAccessToken(null);
       setRole('member');
       setAccountStatus('active');
     } catch (err) {
@@ -368,10 +419,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isAdminOrOwner,
         isLoading,
         authError,
+        driveAccessToken,
         clearAuthError,
         refreshProfileRole,
         repairCurrentAuthSession,
         signInWithGoogle,
+        connectGoogleDrive,
+        getDriveAccessToken,
+        invalidateDriveAccessToken,
         signOutUser,
         getIdToken,
       }}

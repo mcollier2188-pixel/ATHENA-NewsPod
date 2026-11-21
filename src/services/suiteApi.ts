@@ -370,7 +370,7 @@ export async function transcribeAudioClip(payload: {
 export async function generateOrEditImage(payload: {
   prompt: string;
   aspectRatio: string;
-  imageSize: '1K' | '2K';
+  imageSize: '1K' | '2K' | '4K';
   sourceImageBase64?: string;
   sourceMimeType?: string;
 }): Promise<{

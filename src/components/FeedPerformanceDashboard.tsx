@@ -62,6 +62,10 @@ import {
 } from '../services/firestoreAlertAcknowledgments';
 import { formatClock } from '../utils/wavUtils';
 import { useAuth } from '../contexts/AuthContext';
+import {
+  AlertDetailModal,
+  type MasterOrganicDayPoint,
+} from './AlertDetailModal';
 
 export type FeedPerformanceWindow = '7d' | '30d' | '90d';
 export type FeedSeriesFocus = 'all' | 'subscribers' | 'downloads';
@@ -690,6 +694,9 @@ export function FeedPerformanceDashboard({
     useState<AlertDrawerSortDirection>('desc');
   const [expandedAlertId, setExpandedAlertId] = useState<string | null>(null);
   const [focusedAlertId, setFocusedAlertId] = useState<string | null>(null);
+  const [selectedModalAlertId, setSelectedModalAlertId] = useState<
+    string | null
+  >(null);
   const [csvExportFlashCount, setCsvExportFlashCount] = useState<number | null>(
     null
   );
@@ -867,6 +874,7 @@ export function FeedPerformanceDashboard({
     organicTrailing6dDownloads,
     peak90dRollingGrowthPct,
     organicCrossingEntries,
+    masterOrganicPoints,
     targetSubscriberThresholdCount,
     subscriberAxisDomain,
     totalWindowDownloads,
@@ -1368,6 +1376,15 @@ export function FeedPerformanceDashboard({
       },
     ];
 
+    const computedMasterOrganicPoints: MasterOrganicDayPoint[] =
+      masterWithRolling7d.map((pt) => ({
+        dateKey: pt.dateKey,
+        subscribers: pt.organicSubscribers,
+        downloads: pt.organicDownloads,
+        rolling7dGrowthPct: pt.organicRolling7dGrowthPct,
+        featuredEpisodeTitle: pt.featuredEpisodeTitle,
+      }));
+
     return {
       chartData: points,
       currentSubscribers: latestSubs,
@@ -1380,6 +1397,7 @@ export function FeedPerformanceDashboard({
       organicTrailing6dDownloads: trailing6dOrgDownloads,
       peak90dRollingGrowthPct: max90dOrganicGrowth,
       organicCrossingEntries: detectedOrganicEntries,
+      masterOrganicPoints: computedMasterOrganicPoints,
       targetSubscriberThresholdCount: computedTargetSubs,
       subscriberAxisDomain: [yMin, yMax] as [number, number],
       totalWindowDownloads: cumulative,
@@ -1646,6 +1664,28 @@ export function FeedPerformanceDashboard({
     }
     return map;
   }, [archive]);
+
+  const selectedModalAlert = useMemo(() => {
+    if (!selectedModalAlertId) return null;
+    return (
+      visibleAlertHistory.find((e) => e.id === selectedModalAlertId) ||
+      baseAlertHistory.find((e) => e.id === selectedModalAlertId) ||
+      organicCrossingEntries.find((e) => e.id === selectedModalAlertId) ||
+      hydratedTestEntries.find((e) => e.id === selectedModalAlertId) ||
+      null
+    );
+  }, [
+    selectedModalAlertId,
+    visibleAlertHistory,
+    baseAlertHistory,
+    organicCrossingEntries,
+    hydratedTestEntries,
+  ]);
+
+  const selectedModalIndex = useMemo(() => {
+    if (!selectedModalAlertId) return -1;
+    return visibleAlertHistory.findIndex((e) => e.id === selectedModalAlertId);
+  }, [selectedModalAlertId, visibleAlertHistory]);
 
   const effectiveAlertActive = alertConfig.enabled || isSimulatingSurge;
   const currentAlertSignature = `${alertConfig.thresholdPercent}:${currentSubscribers}:live`;
@@ -2158,6 +2198,12 @@ export function FeedPerformanceDashboard({
     window.setTimeout(() => {
       setCsvExportFlashCount(null);
     }, 2400);
+  };
+
+  const handleExportSingleAlertCsv = (entry: FeedAlertHistoryEntry) => {
+    const csvContent = buildAlertHistoryCsvContent([entry]);
+    const safeId = entry.id.replace(/[^a-zA-Z0-9_-]/g, '-');
+    triggerCsvDownload(csvContent, `dispatch-alert-detail-${safeId}.csv`);
   };
 
   const handleClearTestHistory = () => {
@@ -3998,232 +4044,271 @@ export function FeedPerformanceDashboard({
                         entry.deliveryChannelSummary ||
                         'Inline Banner · Chart Target';
 
-                      return (
-                        <Fragment key={entry.id}>
-                          <tr
-                            className={`transition-colors ${
-                              isExpanded || isFocusedOnChart
-                                ? 'bg-[#13161C]/90'
-                                : 'hover:bg-[#13161C]/60'
-                            }`}
-                          >
-                            <td className="py-2.5 px-3 font-mono text-[11px] tabular-nums whitespace-nowrap">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setExpandedAlertId((prev) =>
-                                    prev === entry.id ? null : entry.id
-                                  )
-                                }
-                                aria-expanded={isExpanded}
-                                aria-label={`Inspect metadata for alert on ${entry.dateKey}`}
-                                className="inline-flex items-center gap-1.5 text-left hover:text-[#67E8F9] transition-colors cursor-pointer"
-                              >
-                                {isExpanded ? (
-                                  <ChevronDown
-                                    className="w-3.5 h-3.5 text-[#22D3EE] shrink-0"
-                                    aria-hidden="true"
-                                  />
-                                ) : (
-                                  <ChevronRight
-                                    className="w-3.5 h-3.5 text-[#6E788A] shrink-0"
-                                    aria-hidden="true"
-                                  />
-                                )}
-                                <span className="text-[#F5F7FA]">
-                                  {formatHistoryTimestamp(
-                                    entry.triggeredAt,
-                                    entry.eventType
-                                  )}
-                                </span>
-                                <span
-                                  className="text-[#6E788A]"
-                                  aria-hidden="true"
-                                >
-                                  ·
-                                </span>
-                                <span
-                                  className={
-                                    entry.eventType === 'test'
-                                      ? 'text-[#F59E0B]'
-                                      : 'text-[#67E8F9]'
-                                  }
-                                >
-                                  {entry.eventType === 'test'
-                                    ? 'Test'
-                                    : 'Organic'}
-                                </span>
-                              </button>
-                            </td>
+                       return (
+                         <Fragment key={entry.id}>
+                           <tr
+                             onClick={() => setSelectedModalAlertId(entry.id)}
+                             title="Click row to open Detailed Alert View"
+                             className={`transition-colors cursor-pointer ${
+                               selectedModalAlertId === entry.id ||
+                               isExpanded ||
+                               isFocusedOnChart
+                                 ? 'bg-[#13161C]/90'
+                                 : 'hover:bg-[#13161C]/70'
+                             }`}
+                           >
+                             <td className="py-2.5 px-3 font-mono text-[11px] tabular-nums whitespace-nowrap">
+                               <div className="inline-flex items-center gap-1.5">
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     setExpandedAlertId((prev) =>
+                                       prev === entry.id ? null : entry.id
+                                     );
+                                   }}
+                                   aria-expanded={isExpanded}
+                                   aria-label={`Toggle inline metadata row for alert on ${entry.dateKey}`}
+                                   className="inline-flex items-center justify-center w-5 h-5 rounded hover:bg-[#1E232D] text-[#8B95A7] hover:text-[#67E8F9] transition-colors cursor-pointer shrink-0"
+                                 >
+                                   {isExpanded ? (
+                                     <ChevronDown
+                                       className="w-3.5 h-3.5 text-[#22D3EE] shrink-0"
+                                       aria-hidden="true"
+                                     />
+                                   ) : (
+                                     <ChevronRight
+                                       className="w-3.5 h-3.5 text-[#6E788A] shrink-0"
+                                       aria-hidden="true"
+                                     />
+                                   )}
+                                 </button>
 
-                            <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
-                              <span className="text-[#34D399] font-medium">
-                                +{entry.growthPct.toFixed(1)}%
-                              </span>
-                              <span className="text-[#8B95A7] ml-1.5">
-                                (+{entry.varianceOverThresholdPct.toFixed(1)}%
-                                over +{entry.thresholdPercent}%)
-                              </span>
-                            </td>
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     setSelectedModalAlertId(entry.id);
+                                   }}
+                                   aria-label={`Open Detailed Alert View for alert on ${entry.dateKey}`}
+                                   className="inline-flex items-center gap-1.5 text-left hover:text-[#67E8F9] transition-colors cursor-pointer"
+                                 >
+                                   <span className="text-[#F5F7FA] underline decoration-[#262B36] hover:decoration-[#22D3EE] underline-offset-2">
+                                     {formatHistoryTimestamp(
+                                       entry.triggeredAt,
+                                       entry.eventType
+                                     )}
+                                   </span>
+                                   <span
+                                     className="text-[#6E788A]"
+                                     aria-hidden="true"
+                                   >
+                                     ·
+                                   </span>
+                                   <span
+                                     className={
+                                       entry.eventType === 'test'
+                                         ? 'text-[#F59E0B]'
+                                         : 'text-[#67E8F9]'
+                                     }
+                                   >
+                                     {entry.eventType === 'test'
+                                       ? 'Test'
+                                       : 'Organic'}
+                                   </span>
+                                 </button>
+                               </div>
+                             </td>
 
-                            <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
-                              <span className="text-[#A0AABB]">
-                                {entry.startSubscribers.toLocaleString()} &rarr;{' '}
-                                {entry.endSubscribers.toLocaleString()}
-                              </span>
-                              <span className="text-[#F5F7FA] font-medium ml-1.5">
-                                (+{entry.netNewSubscribers})
-                              </span>
-                            </td>
+                             <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
+                               <span className="text-[#34D399] font-medium">
+                                 +{entry.growthPct.toFixed(1)}%
+                               </span>
+                               <span className="text-[#8B95A7] ml-1.5">
+                                 (+{entry.varianceOverThresholdPct.toFixed(1)}%
+                                 over +{entry.thresholdPercent}%)
+                               </span>
+                             </td>
 
-                            <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
-                              <span className="text-[#E5E7EB]">
-                                {entry.trailing7dDownloads.toLocaleString()}
-                              </span>
-                              <span className="text-[#6E788A] ml-1">
-                                ({entry.dailyDownloads}/d)
-                              </span>
-                            </td>
+                             <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
+                               <span className="text-[#A0AABB]">
+                                 {entry.startSubscribers.toLocaleString()} &rarr;{' '}
+                                 {entry.endSubscribers.toLocaleString()}
+                               </span>
+                               <span className="text-[#F5F7FA] font-medium ml-1.5">
+                                 (+{entry.netNewSubscribers})
+                               </span>
+                             </td>
 
-                            <td className="py-2.5 px-3 max-w-[240px]">
-                              {matchedBriefing ? (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    onOpenBriefing(matchedBriefing)
-                                  }
-                                  className="font-serif text-xs text-[#E5E7EB] hover:text-[#67E8F9] truncate block max-w-full text-left transition-colors cursor-pointer"
-                                >
-                                  {entry.driverEpisodeTitle}
-                                </button>
-                              ) : (
-                                <span className="font-serif text-xs text-[#A0AABB] truncate block">
-                                  {entry.driverEpisodeTitle}
-                                </span>
-                              )}
-                              <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-[#6E788A] truncate">
-                                <span>{resolvedClientFamily}</span>
-                                <span aria-hidden="true">·</span>
-                                <span className="tabular-nums">
-                                  {resolvedDlPerSub.toFixed(1)}x vel
-                                </span>
-                              </div>
-                            </td>
+                             <td className="py-2.5 px-3 text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
+                               <span className="text-[#E5E7EB]">
+                                 {entry.trailing7dDownloads.toLocaleString()}
+                               </span>
+                               <span className="text-[#6E788A] ml-1">
+                                 ({entry.dailyDownloads}/d)
+                               </span>
+                             </td>
 
-                            <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                              <div className="inline-flex flex-col items-end gap-0.5">
-                                {isRowAcknowledged ? (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-[#34D399]/40 bg-[#064E3B]/35 text-[#6EE7B7] font-mono text-[11px] font-medium whitespace-nowrap shrink-0">
-                                    <CheckCircle2
-                                      className="w-3 h-3 text-[#34D399] shrink-0"
-                                      aria-hidden="true"
-                                    />
-                                    <span>Acknowledged</span>
-                                  </span>
-                                ) : (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-[#F59E0B]/40 bg-[#78350F]/30 text-[#FCD34D] font-mono text-[11px] font-medium whitespace-nowrap shrink-0">
-                                    <Clock
-                                      className="w-3 h-3 text-[#FBBF24] shrink-0"
-                                      aria-hidden="true"
-                                    />
-                                    <span>Pending</span>
-                                  </span>
-                                )}
-                                <span className="font-mono text-[10px] text-[#6E788A] whitespace-nowrap">
-                                  {lifecycleContextLabel}
-                                  {entry.ackSyncSource === 'firestore'
-                                    ? ' · Firestore'
-                                    : ''}
-                                </span>
-                              </div>
-                            </td>
+                             <td className="py-2.5 px-3 max-w-[240px]">
+                               {matchedBriefing ? (
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     onOpenBriefing(matchedBriefing);
+                                   }}
+                                   className="font-serif text-xs text-[#E5E7EB] hover:text-[#67E8F9] truncate block max-w-full text-left transition-colors cursor-pointer"
+                                 >
+                                   {entry.driverEpisodeTitle}
+                                 </button>
+                               ) : (
+                                 <span className="font-serif text-xs text-[#A0AABB] truncate block">
+                                   {entry.driverEpisodeTitle}
+                                 </span>
+                               )}
+                               <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-[#6E788A] truncate">
+                                 <span>{resolvedClientFamily}</span>
+                                 <span aria-hidden="true">·</span>
+                                 <span className="tabular-nums">
+                                   {resolvedDlPerSub.toFixed(1)}x vel
+                                 </span>
+                               </div>
+                             </td>
 
-                            <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                              <div className="inline-flex items-center justify-end gap-2">
-                                <div className="inline-flex items-center gap-1.5 px-2 h-7 rounded border border-[#262B36] bg-[#0F1218]">
-                                  <button
-                                    type="button"
-                                    role="switch"
-                                    aria-checked={isRowAcknowledged}
-                                    disabled={isRowSyncing}
-                                    onClick={() =>
-                                      handleToggleRowAcknowledge(entry)
-                                    }
-                                    aria-label={`Toggle acknowledgment status for alert on ${entry.dateKey}`}
-                                    className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors cursor-pointer disabled:opacity-50 ${
-                                      isRowAcknowledged
-                                        ? 'bg-[#22D3EE]'
-                                        : 'bg-[#2A303C]'
-                                    }`}
-                                  >
-                                    <span
-                                      className={`inline-block h-2.5 w-2.5 rounded-full bg-[#071318] transition-transform ${
-                                        isRowAcknowledged
-                                          ? 'translate-x-3.5'
-                                          : 'translate-x-0.5'
-                                      }`}
-                                    />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    disabled={isRowSyncing}
-                                    onClick={() =>
-                                      handleToggleRowAcknowledge(entry)
-                                    }
-                                    className={`text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 ${
-                                      isRowAcknowledged
-                                        ? 'text-[#67E8F9] hover:text-[#F5F7FA]'
-                                        : 'text-[#A0AABB] hover:text-[#F5F7FA]'
-                                    }`}
-                                  >
-                                    {isRowSyncing
-                                      ? 'Syncing...'
-                                      : isRowAcknowledged
-                                        ? 'Acknowledged'
-                                        : 'Mark Ack'}
-                                  </button>
-                                </div>
+                             <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                               <div className="inline-flex flex-col items-end gap-0.5">
+                                 {isRowAcknowledged ? (
+                                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-[#34D399]/40 bg-[#064E3B]/35 text-[#6EE7B7] font-mono text-[11px] font-medium whitespace-nowrap shrink-0">
+                                     <CheckCircle2
+                                       className="w-3 h-3 text-[#34D399] shrink-0"
+                                       aria-hidden="true"
+                                     />
+                                     <span>Acknowledged</span>
+                                   </span>
+                                 ) : (
+                                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-[#F59E0B]/40 bg-[#78350F]/30 text-[#FCD34D] font-mono text-[11px] font-medium whitespace-nowrap shrink-0">
+                                     <Clock
+                                       className="w-3 h-3 text-[#FBBF24] shrink-0"
+                                       aria-hidden="true"
+                                     />
+                                     <span>Pending</span>
+                                   </span>
+                                 )}
+                                 <span className="font-mono text-[10px] text-[#6E788A] whitespace-nowrap">
+                                   {lifecycleContextLabel}
+                                   {entry.ackSyncSource === 'firestore'
+                                     ? ' · Firestore'
+                                     : ''}
+                                 </span>
+                               </div>
+                             </td>
 
-                                <button
-                                  type="button"
-                                  onClick={() => handleFocusAlertOnChart(entry)}
-                                  title="Highlight this alert date on the Feed Performance chart"
-                                  className={`h-7 px-2 inline-flex items-center gap-1 text-[11px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                                    isFocusedOnChart
-                                      ? 'bg-[#171C24] border-[#22D3EE] text-[#67E8F9]'
-                                      : 'bg-[#0F1218] border-[#262B36] text-[#A0AABB] hover:border-[#22D3EE]/50 hover:text-[#F5F7FA]'
-                                  }`}
-                                >
-                                  <Crosshair
-                                    className="w-3 h-3"
-                                    aria-hidden="true"
-                                  />
-                                  <span>
-                                    {isFocusedOnChart
-                                      ? 'Focused'
-                                      : 'Focus Chart'}
-                                  </span>
-                                </button>
+                             <td
+                               onClick={(e) => e.stopPropagation()}
+                               className="py-2.5 px-3 text-right whitespace-nowrap"
+                             >
+                               <div className="inline-flex items-center justify-end gap-1.5">
+                                 <div className="inline-flex items-center gap-1.5 px-2 h-7 rounded border border-[#262B36] bg-[#0F1218]">
+                                   <button
+                                     type="button"
+                                     role="switch"
+                                     aria-checked={isRowAcknowledged}
+                                     disabled={isRowSyncing}
+                                     onClick={(e) => {
+                                       e.stopPropagation();
+                                       handleToggleRowAcknowledge(entry);
+                                     }}
+                                     aria-label={`Toggle acknowledgment status for alert on ${entry.dateKey}`}
+                                     className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors cursor-pointer disabled:opacity-50 ${
+                                       isRowAcknowledged
+                                         ? 'bg-[#22D3EE]'
+                                         : 'bg-[#2A303C]'
+                                     }`}
+                                   >
+                                     <span
+                                       className={`inline-block h-2.5 w-2.5 rounded-full bg-[#071318] transition-transform ${
+                                         isRowAcknowledged
+                                           ? 'translate-x-3.5'
+                                           : 'translate-x-0.5'
+                                       }`}
+                                     />
+                                   </button>
+                                   <button
+                                     type="button"
+                                     disabled={isRowSyncing}
+                                     onClick={(e) => {
+                                       e.stopPropagation();
+                                       handleToggleRowAcknowledge(entry);
+                                     }}
+                                     className={`text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 ${
+                                       isRowAcknowledged
+                                         ? 'text-[#67E8F9] hover:text-[#F5F7FA]'
+                                         : 'text-[#A0AABB] hover:text-[#F5F7FA]'
+                                     }`}
+                                   >
+                                     {isRowSyncing
+                                       ? 'Syncing...'
+                                       : isRowAcknowledged
+                                         ? 'Acknowledged'
+                                         : 'Mark Ack'}
+                                   </button>
+                                 </div>
 
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setExpandedAlertId((prev) =>
-                                      prev === entry.id ? null : entry.id
-                                    )
-                                  }
-                                  aria-expanded={isExpanded}
-                                  className={`h-7 px-2 text-[11px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                                    isExpanded
-                                      ? 'bg-[#171C24] border-[#22D3EE]/50 text-[#F5F7FA]'
-                                      : 'bg-[#0F1218] border-[#262B36] text-[#8B95A7] hover:text-[#F5F7FA]'
-                                  }`}
-                                >
-                                  {isExpanded ? 'Hide Meta' : 'Metadata'}
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     setSelectedModalAlertId(entry.id);
+                                   }}
+                                   className="h-7 px-2 text-[11px] font-medium rounded border border-[#22D3EE]/45 bg-[#0F1218] text-[#67E8F9] hover:border-[#22D3EE] hover:text-[#F5F7FA] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                                 >
+                                   Details
+                                 </button>
+
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     handleFocusAlertOnChart(entry);
+                                   }}
+                                   title="Highlight this alert date on the Feed Performance chart"
+                                   className={`h-7 px-2 inline-flex items-center gap-1 text-[11px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                     isFocusedOnChart
+                                       ? 'bg-[#171C24] border-[#22D3EE] text-[#67E8F9]'
+                                       : 'bg-[#0F1218] border-[#262B36] text-[#A0AABB] hover:border-[#22D3EE]/50 hover:text-[#F5F7FA]'
+                                   }`}
+                                 >
+                                   <Crosshair
+                                     className="w-3 h-3"
+                                     aria-hidden="true"
+                                   />
+                                   <span>
+                                     {isFocusedOnChart
+                                       ? 'Focused'
+                                       : 'Focus Chart'}
+                                   </span>
+                                 </button>
+
+                                 <button
+                                   type="button"
+                                   onClick={(e) => {
+                                     e.stopPropagation();
+                                     setExpandedAlertId((prev) =>
+                                       prev === entry.id ? null : entry.id
+                                     );
+                                   }}
+                                   aria-expanded={isExpanded}
+                                   className={`h-7 px-2 text-[11px] font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                     isExpanded
+                                       ? 'bg-[#171C24] border-[#22D3EE]/50 text-[#F5F7FA]'
+                                       : 'bg-[#0F1218] border-[#262B36] text-[#8B95A7] hover:text-[#F5F7FA]'
+                                   }`}
+                                 >
+                                   {isExpanded ? 'Hide Meta' : 'Metadata'}
+                                 </button>
+                               </div>
+                             </td>
+                           </tr>
 
                           {isExpanded && (
                             <tr className="bg-[#0F1218]">
@@ -4347,6 +4432,46 @@ export function FeedPerformanceDashboard({
           </div>
         </div>
       </div>
+
+      {/* Detailed Alert View Modal for Deep Subscriber Delta & Growth Velocity Analysis */}
+      <AlertDetailModal
+        entry={selectedModalAlert}
+        onClose={() => setSelectedModalAlertId(null)}
+        masterOrganicPoints={masterOrganicPoints}
+        matchedBriefing={
+          selectedModalAlert?.driverBriefingId
+            ? archiveByIdMap.get(selectedModalAlert.driverBriefingId) || null
+            : null
+        }
+        onOpenBriefing={onOpenBriefing}
+        onFocusOnChart={handleFocusAlertOnChart}
+        onToggleAcknowledge={handleToggleRowAcknowledge}
+        isSyncingAck={
+          selectedModalAlert
+            ? Boolean(pendingAckKeys[getCanonicalAlertKey(selectedModalAlert)])
+            : false
+        }
+        onExportSingleAlertCsv={handleExportSingleAlertCsv}
+        currentIndex={selectedModalIndex}
+        totalVisibleCount={visibleAlertHistory.length}
+        onSelectPrevious={
+          selectedModalIndex > 0
+            ? () => {
+                const prevEntry = visibleAlertHistory[selectedModalIndex - 1];
+                if (prevEntry) setSelectedModalAlertId(prevEntry.id);
+              }
+            : undefined
+        }
+        onSelectNext={
+          selectedModalIndex >= 0 &&
+          selectedModalIndex < visibleAlertHistory.length - 1
+            ? () => {
+                const nextEntry = visibleAlertHistory[selectedModalIndex + 1];
+                if (nextEntry) setSelectedModalAlertId(nextEntry.id);
+              }
+            : undefined
+        }
+      />
     </section>
   );
 }

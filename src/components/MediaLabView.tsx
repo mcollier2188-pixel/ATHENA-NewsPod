@@ -147,7 +147,7 @@ export function MediaLabView({
     'Architectural dusk photograph of a cantilevered concrete and warm cedar pavilion overlooking calm water, crisp reflections, editorial lighting'
   );
   const [imgAspect, setImgAspect] = useState<'16:9' | '1:1' | '4:3' | '9:16'>('16:9');
-  const [imgSize, setImgSize] = useState<'1K' | '2K'>('1K');
+  const [imgSize, setImgSize] = useState<'1K' | '2K' | '4K'>('1K');
   const [editSourceImg, setEditSourceImg] = useState<{
     dataUrl: string;
     mimeType: string;
@@ -637,11 +637,12 @@ export function MediaLabView({
                   </label>
                   <select
                     value={imgSize}
-                    onChange={(e) => setImgSize(e.target.value as '1K' | '2K')}
+                    onChange={(e) => setImgSize(e.target.value as '1K' | '2K' | '4K')}
                     className="w-full h-10 px-3 bg-[#0B0D10] border border-[#22D3EE]/25 rounded-md text-xs text-[#F5F7FA]"
                   >
                     <option value="1K">1K Fast</option>
                     <option value="2K">2K High Detail</option>
+                    <option value="4K">4K Ultra</option>
                   </select>
                 </div>
               </div>
