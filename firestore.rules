@@ -1,0 +1,931 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------- Shared Security Primitives ----------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isPrincipalOwner() {
+      return isVerifiedUser() && request.auth.token.email == 'mcollier2188@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Single-document RBAC helper (never invoked inside allow list to preserve O(1) query cost)
+    function isVerifiedStudioAdmin() {
+      return isVerifiedUser()
+        && isValidId(request.auth.uid)
+        && exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid))
+        && get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'admin'
+        && get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.accountStatus == 'active';
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(ownerId) {
+      return isVerifiedUser() && ownerId == request.auth.uid;
+    }
+
+    function isBoundedString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isOptionalBoundedString(mapData, key, maxLen) {
+      return !(key in mapData) || (mapData[key] is string && mapData[key].size() <= maxLen);
+    }
+
+    function isBoundedListOfStrings(listVal, maxItems) {
+      return listVal is list
+        && listVal.size() <= maxItems
+        && (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 300));
+    }
+
+    function isBoundedListOfMaps(listVal, maxItems) {
+      return listVal is list
+        && listVal.size() <= maxItems
+        && (listVal.size() == 0 || listVal[0] is map);
+    }
+
+    // ---------- Validation Blueprints ----------
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+        'uid',
+        'email',
+        'displayName',
+        'photoUrl',
+        'authProvider',
+        'emailVerified',
+        'role',
+        'isOwner',
+        'accountStatus',
+        'syncSource',
+        'lastSyncedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid',
+        'email',
+        'displayName',
+        'photoUrl',
+        'authProvider',
+        'emailVerified',
+        'role',
+        'isOwner',
+        'accountStatus',
+        'syncSource',
+        'lastSyncedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.uid)
+      && data.uid == userId
+      && isBoundedString(data.email, 3, 200)
+      && isBoundedString(data.displayName, 0, 140)
+      && isBoundedString(data.photoUrl, 0, 2048)
+      && isBoundedString(data.authProvider, 1, 64)
+      && data.emailVerified is bool
+      && data.role in ['owner', 'admin', 'member']
+      && data.isOwner is bool
+      && data.isOwner == (data.role == 'owner')
+      && data.accountStatus in ['active', 'suspended']
+      && data.syncSource in ['google_signin', 'repair_auth', 'sync_auth', 'admin_governance']
+      && isBoundedString(data.lastSyncedAtIso, 1, 64)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidPaletteMap(p) {
+      return p is map
+        && p.keys().hasAll(['primary', 'accent', 'canvasMode'])
+        && p.keys().hasOnly([
+          'primary',
+          'accent',
+          'canvasMode',
+          'onPrimary',
+          'onAccent',
+          'accentText',
+          'heroKickerText'
+        ])
+        && isBoundedString(p.primary, 4, 32)
+        && isBoundedString(p.accent, 4, 32)
+        && p.canvasMode in ['light', 'dark']
+        && isOptionalBoundedString(p, 'onPrimary', 32)
+        && isOptionalBoundedString(p, 'onAccent', 32)
+        && isOptionalBoundedString(p, 'accentText', 32)
+        && isOptionalBoundedString(p, 'heroKickerText', 32);
+    }
+
+    function isValidBrandMap(b) {
+      return b is map
+        && b.keys().hasAll([
+          'name',
+          'industry',
+          'serviceArea',
+          'phone',
+          'email',
+          'hours',
+          'address',
+          'palette',
+          'fontMood'
+        ])
+        && b.keys().hasOnly([
+          'name',
+          'industry',
+          'serviceArea',
+          'phone',
+          'email',
+          'hours',
+          'address',
+          'logoRef',
+          'palette',
+          'fontMood',
+          'fontPairing'
+        ])
+        && isBoundedString(b.name, 0, 200)
+        && isBoundedString(b.industry, 0, 200)
+        && isBoundedString(b.serviceArea, 0, 300)
+        && isBoundedString(b.phone, 0, 80)
+        && isBoundedString(b.email, 0, 200)
+        && isBoundedString(b.hours, 0, 200)
+        && isBoundedString(b.address, 0, 400)
+        && isOptionalBoundedString(b, 'logoRef', 200000)
+        && isValidPaletteMap(b.palette)
+        && b.fontMood in ['industrial', 'editorial', 'modern']
+        && (!('fontPairing' in b) || b.fontPairing is map);
+    }
+
+    function isValidHeroMap(h) {
+      return h is map
+        && h.keys().hasAll([
+          'kicker',
+          'headline',
+          'subheadline',
+          'primaryCta',
+          'secondaryCta',
+          'trustHighlights'
+        ])
+        && h.keys().hasOnly([
+          'kicker',
+          'headline',
+          'subheadline',
+          'primaryCta',
+          'secondaryCta',
+          'trustHighlights',
+          'photoRef'
+        ])
+        && isBoundedString(h.kicker, 0, 200)
+        && isBoundedString(h.headline, 0, 400)
+        && isBoundedString(h.subheadline, 0, 1200)
+        && isBoundedString(h.primaryCta, 0, 120)
+        && isBoundedString(h.secondaryCta, 0, 120)
+        && isBoundedListOfStrings(h.trustHighlights, 10)
+        && isOptionalBoundedString(h, 'photoRef', 250000);
+    }
+
+    function isValidAboutMap(a) {
+      return a is map
+        && a.keys().hasAll(['heading', 'story', 'credentials'])
+        && a.keys().hasOnly(['heading', 'story', 'credentials'])
+        && isBoundedString(a.heading, 0, 300)
+        && isBoundedString(a.story, 0, 5000)
+        && isBoundedListOfStrings(a.credentials, 20);
+    }
+
+    function isValidQuoteFormMap(q) {
+      return q is map
+        && q.keys().hasAll(['heading', 'subtext', 'submitLabel'])
+        && q.keys().hasOnly(['heading', 'subtext', 'submitLabel'])
+        && isBoundedString(q.heading, 0, 300)
+        && isBoundedString(q.subtext, 0, 1000)
+        && isBoundedString(q.submitLabel, 0, 120);
+    }
+
+    function isValidSectionVisibility(v) {
+      return v is map
+        && v.keys().hasAll(['services', 'projects', 'about', 'quote'])
+        && v.keys().hasOnly(['services', 'projects', 'about', 'quote'])
+        && v.services is bool
+        && v.projects is bool
+        && v.about is bool
+        && v.quote is bool;
+    }
+
+    function isValidLockedSections(l) {
+      return l is map
+        && l.keys().hasOnly(['services', 'projects', 'about', 'quote']);
+    }
+
+    function isValidSiteMockup(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'projectId',
+        'sourceUrl',
+        'clientUpdatedAt',
+        'brand',
+        'brandSwatches',
+        'suggestedFontPairings',
+        'hero',
+        'services',
+        'projects',
+        'about',
+        'quoteForm',
+        'sectionVisibility',
+        'sectionOrder',
+        'lockedSections',
+        'siteNotes',
+        'revision',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ownerId',
+        'projectId',
+        'sourceUrl',
+        'lastImportedAt',
+        'clientUpdatedAt',
+        'brand',
+        'brandSwatches',
+        'suggestedFontPairings',
+        'hero',
+        'services',
+        'projects',
+        'about',
+        'quoteForm',
+        'sectionVisibility',
+        'sectionOrder',
+        'lockedSections',
+        'siteNotes',
+        'revision',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isValidId(data.projectId)
+      && isBoundedString(data.sourceUrl, 0, 2048)
+      && isOptionalBoundedString(data, 'lastImportedAt', 64)
+      && isBoundedString(data.clientUpdatedAt, 1, 64)
+      && isValidBrandMap(data.brand)
+      && isBoundedListOfMaps(data.brandSwatches, 20)
+      && isBoundedListOfMaps(data.suggestedFontPairings, 12)
+      && isValidHeroMap(data.hero)
+      && isBoundedListOfMaps(data.services, 24)
+      && isBoundedListOfMaps(data.projects, 24)
+      && isValidAboutMap(data.about)
+      && isValidQuoteFormMap(data.quoteForm)
+      && isValidSectionVisibility(data.sectionVisibility)
+      && isBoundedListOfStrings(data.sectionOrder, 4)
+      && isValidLockedSections(data.lockedSections)
+      && isBoundedString(data.siteNotes, 0, 10000)
+      && data.revision is number
+      && data.revision >= 1
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidSiteMockupMediaAsset(data, mockupId, assetId) {
+      return data.keys().hasAll([
+        'ownerId',
+        'mockupId',
+        'assetId',
+        'label',
+        'category',
+        'slotKey',
+        'dataUrl',
+        'width',
+        'height',
+        'sizeKb',
+        'addedAt',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ownerId',
+        'mockupId',
+        'assetId',
+        'label',
+        'category',
+        'slotKey',
+        'dataUrl',
+        'width',
+        'height',
+        'sizeKb',
+        'addedAt',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isValidId(data.mockupId)
+      && data.mockupId == mockupId
+      && isValidId(data.assetId)
+      && data.assetId == assetId
+      && isBoundedString(data.label, 1, 200)
+      && data.category in ['logo', 'hero', 'project', 'site-photo']
+      && isBoundedString(data.slotKey, 0, 128)
+      && isBoundedString(data.dataUrl, 1, 700000)
+      && data.width is number
+      && data.width >= 0
+      && data.width <= 16000
+      && data.height is number
+      && data.height >= 0
+      && data.height <= 16000
+      && data.sizeKb is number
+      && data.sizeKb >= 0
+      && data.sizeKb <= 1024
+      && isBoundedString(data.addedAt, 1, 64)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidBriefingSharePayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'editionTitle',
+          'editionSubtitle',
+          'briefingCreatedAt',
+          'takeaways',
+          'listenerFocus',
+          'format',
+          'tone',
+          'voiceName',
+          'coHostVoiceName',
+          'articleTitles',
+          'segments',
+          'hasAudio',
+          'recordedChapters',
+          'totalDurationSeconds'
+        ])
+        && p.keys().hasOnly([
+          'editionTitle',
+          'editionSubtitle',
+          'briefingCreatedAt',
+          'takeaways',
+          'listenerFocus',
+          'format',
+          'tone',
+          'voiceName',
+          'coHostVoiceName',
+          'articleTitles',
+          'segments',
+          'hasAudio',
+          'recordedChapters',
+          'totalDurationSeconds'
+        ])
+        && isBoundedString(p.editionTitle, 1, 300)
+        && isBoundedString(p.editionSubtitle, 0, 500)
+        && isBoundedString(p.briefingCreatedAt, 1, 64)
+        && isBoundedListOfStrings(p.takeaways, 30)
+        && isBoundedString(p.listenerFocus, 0, 2000)
+        && p.format in ['solo', 'podcast']
+        && isBoundedString(p.tone, 1, 64)
+        && isBoundedString(p.voiceName, 1, 64)
+        && isBoundedString(p.coHostVoiceName, 0, 64)
+        && isBoundedListOfStrings(p.articleTitles, 40)
+        && isBoundedListOfMaps(p.segments, 24)
+        && p.hasAudio is bool
+        && p.recordedChapters is number
+        && p.recordedChapters >= 0
+        && p.recordedChapters <= 24
+        && p.totalDurationSeconds is number
+        && p.totalDurationSeconds >= 0
+        && p.totalDurationSeconds <= 14400;
+    }
+
+    function isValidMockupSharePayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'projectId',
+          'sourceUrl',
+          'clientUpdatedAt',
+          'brand',
+          'hero',
+          'services',
+          'projects',
+          'about',
+          'quoteForm',
+          'sectionVisibility',
+          'sectionOrder',
+          'siteNotes'
+        ])
+        && p.keys().hasOnly([
+          'projectId',
+          'sourceUrl',
+          'clientUpdatedAt',
+          'brand',
+          'hero',
+          'services',
+          'projects',
+          'about',
+          'quoteForm',
+          'sectionVisibility',
+          'sectionOrder',
+          'siteNotes'
+        ])
+        && isBoundedString(p.projectId, 1, 128)
+        && isBoundedString(p.sourceUrl, 0, 2048)
+        && isBoundedString(p.clientUpdatedAt, 1, 64)
+        && isValidBrandMap(p.brand)
+        && isValidHeroMap(p.hero)
+        && isBoundedListOfMaps(p.services, 24)
+        && isBoundedListOfMaps(p.projects, 24)
+        && isValidAboutMap(p.about)
+        && isValidQuoteFormMap(p.quoteForm)
+        && isValidSectionVisibility(p.sectionVisibility)
+        && isBoundedListOfStrings(p.sectionOrder, 4)
+        && isBoundedString(p.siteNotes, 0, 10000);
+    }
+
+    function isValidPublicSharePayload(p, kind) {
+      return (kind == 'briefing' && isValidBriefingSharePayload(p))
+        || (kind == 'mockup' && isValidMockupSharePayload(p));
+    }
+
+    function isValidOptionalShareId(val) {
+      return val is string
+        && val.size() <= 128
+        && (val.size() == 0 || val.matches('^[a-zA-Z0-9_\\-]+$'));
+    }
+
+    function isValidPublicShareLink(data, shareId) {
+      return data.keys().hasAll([
+        'shareId',
+        'kind',
+        'sharePath',
+        'status',
+        'ownerId',
+        'title',
+        'subtitle',
+        'note',
+        'ttlHours',
+        'createdAtIso',
+        'expiresAtIso',
+        'expiresAt',
+        'relinkedFromShareId',
+        'relinkedToShareId',
+        'scrubbedAtIso',
+        'scrubbedFindingCount',
+        'payload',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'shareId',
+        'kind',
+        'sharePath',
+        'status',
+        'ownerId',
+        'title',
+        'subtitle',
+        'note',
+        'ttlHours',
+        'createdAtIso',
+        'expiresAtIso',
+        'expiresAt',
+        'relinkedFromShareId',
+        'relinkedToShareId',
+        'scrubbedAtIso',
+        'scrubbedFindingCount',
+        'payload',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.shareId)
+      && data.shareId == shareId
+      && data.kind in ['briefing', 'mockup']
+      && isBoundedString(data.sharePath, 1, 180)
+      && data.status in ['active', 'revoked', 'scrubbed_relinked']
+      && isValidId(data.ownerId)
+      && isBoundedString(data.title, 1, 300)
+      && isBoundedString(data.subtitle, 0, 400)
+      && isBoundedString(data.note, 0, 400)
+      && data.ttlHours in [24, 72, 168]
+      && isBoundedString(data.createdAtIso, 1, 64)
+      && isBoundedString(data.expiresAtIso, 1, 64)
+      && data.expiresAt is timestamp
+      && isValidOptionalShareId(data.relinkedFromShareId)
+      && isValidOptionalShareId(data.relinkedToShareId)
+      && isBoundedString(data.scrubbedAtIso, 0, 64)
+      && data.scrubbedFindingCount is number
+      && data.scrubbedFindingCount >= 0
+      && data.scrubbedFindingCount <= 500
+      && isValidPublicSharePayload(data.payload, data.kind)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    // ---------- Action Helpers for Updates ----------
+
+    function isSelfProfileMetadataSyncAction(userId) {
+      return userId == request.auth.uid
+        && !isPrincipalOwner()
+        && existing().uid == request.auth.uid
+        && existing().accountStatus == 'active'
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().role == existing().role
+        && incoming().isOwner == existing().isOwner
+        && incoming().accountStatus == existing().accountStatus
+        && incoming().email == request.auth.token.email
+        && incoming().emailVerified == true
+        && incoming().updatedAt == request.time;
+    }
+
+    function isPrincipalOwnerSelfSyncAction(userId) {
+      return isPrincipalOwner()
+        && userId == request.auth.uid
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().email == request.auth.token.email
+        && incoming().emailVerified == true
+        && incoming().role == 'owner'
+        && incoming().isOwner == true
+        && incoming().accountStatus == 'active'
+        && incoming().updatedAt == request.time;
+    }
+
+    function isPrincipalOwnerCollaboratorRepairAction(userId) {
+      return isPrincipalOwner()
+        && userId != request.auth.uid
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().role in ['admin', 'member']
+        && incoming().isOwner == false
+        && incoming().updatedAt == request.time;
+    }
+
+    function isSiteMockupOwnerSyncAction() {
+      return isOwner(existing().ownerId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().revision > existing().revision;
+    }
+
+    function isMediaAssetOwnerUpdateAction() {
+      return isOwner(existing().ownerId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().mockupId == existing().mockupId
+        && incoming().assetId == existing().assetId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function isPublicShareOwnerSyncAction() {
+      return isOwner(existing().ownerId)
+        && existing().status == 'active'
+        && incoming().status == 'active'
+        && incoming().shareId == existing().shareId
+        && incoming().kind == existing().kind
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdAtIso == existing().createdAtIso
+        && incoming().relinkedFromShareId == existing().relinkedFromShareId
+        && incoming().relinkedToShareId == existing().relinkedToShareId
+        && incoming().updatedAt == request.time;
+    }
+
+    function isPublicShareOwnerRevokeAction() {
+      return isOwner(existing().ownerId)
+        && existing().status == 'active'
+        && incoming().status == 'revoked'
+        && incoming().shareId == existing().shareId
+        && incoming().kind == existing().kind
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdAtIso == existing().createdAtIso
+        && incoming().updatedAt == request.time;
+    }
+
+    function isAdminPublicShareGovernanceAction() {
+      return (isPrincipalOwner() || isVerifiedStudioAdmin())
+        && incoming().shareId == existing().shareId
+        && incoming().kind == existing().kind
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdAtIso == existing().createdAtIso
+        && incoming().updatedAt == request.time;
+    }
+
+    // ---------- Collection: /userProfiles/{userId} ----------
+
+    match /userProfiles/{userId} {
+      // PII-containing identity record strictly restricted to the profile owner or verified Principal Owner.
+      allow get: if isVerifiedUser()
+        && isValidId(userId)
+        && (isPrincipalOwner() || userId == request.auth.uid);
+
+      allow list: if isVerifiedUser()
+        && (isPrincipalOwner() || ('uid' in existing() && existing().uid == request.auth.uid));
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          // Standard verified user bootstrapping their own non-privileged profile
+          (
+            userId == request.auth.uid
+            && !isPrincipalOwner()
+            && incoming().email == request.auth.token.email
+            && incoming().emailVerified == true
+            && incoming().role == 'member'
+            && incoming().isOwner == false
+            && incoming().accountStatus == 'active'
+          )
+          // Verified Principal Owner bootstrapping own Ultra Owner profile
+          || (
+            isPrincipalOwner()
+            && userId == request.auth.uid
+            && incoming().email == request.auth.token.email
+            && incoming().emailVerified == true
+            && incoming().role == 'owner'
+            && incoming().isOwner == true
+            && incoming().accountStatus == 'active'
+          )
+          // Verified Principal Owner seeding or repairing a collaborator profile
+          || (
+            isPrincipalOwner()
+            && userId != request.auth.uid
+            && incoming().role in ['admin', 'member']
+            && incoming().isOwner == false
+          )
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && (
+          (
+            isSelfProfileMetadataSyncAction(userId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'email',
+              'displayName',
+              'photoUrl',
+              'authProvider',
+              'emailVerified',
+              'syncSource',
+              'lastSyncedAtIso',
+              'updatedAt'
+            ])
+          )
+          || (
+            (
+              isPrincipalOwnerSelfSyncAction(userId)
+              || isPrincipalOwnerCollaboratorRepairAction(userId)
+            )
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'email',
+              'displayName',
+              'photoUrl',
+              'authProvider',
+              'emailVerified',
+              'role',
+              'isOwner',
+              'accountStatus',
+              'syncSource',
+              'lastSyncedAtIso',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isPrincipalOwner()
+        && isValidId(userId);
+    }
+
+    // ---------- Collection: /siteMockups/{mockupId} ----------
+
+    match /siteMockups/{mockupId} {
+      // PII-containing workspace (phone, email, address) is strictly owner-only.
+      // When resource is null (first-time session bootstrap), only the caller's deterministic workspace ID is readable.
+      allow get: if isVerifiedUser()
+        && isValidId(mockupId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (mockupId == ('mockup_' + request.auth.uid) || isPrincipalOwner()))
+        );
+
+      allow list: if isVerifiedUser()
+        && (existing().ownerId == request.auth.uid || isPrincipalOwner());
+
+      allow create: if isVerifiedUser()
+        && isValidId(mockupId)
+        && isValidSiteMockup(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(mockupId)
+        && isValidSiteMockup(incoming())
+        && (
+          isSiteMockupOwnerSyncAction()
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'projectId',
+            'sourceUrl',
+            'lastImportedAt',
+            'clientUpdatedAt',
+            'brand',
+            'brandSwatches',
+            'suggestedFontPairings',
+            'hero',
+            'services',
+            'projects',
+            'about',
+            'quoteForm',
+            'sectionVisibility',
+            'sectionOrder',
+            'lockedSections',
+            'siteNotes',
+            'revision',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(mockupId)
+        && (existing().ownerId == request.auth.uid || isPrincipalOwner());
+
+      // ---------- Subcollection: /siteMockups/{mockupId}/mediaAssets/{assetId} ----------
+
+      match /mediaAssets/{assetId} {
+        allow get: if isVerifiedUser()
+          && isValidId(mockupId)
+          && isValidId(assetId)
+          && (
+            (
+              existing().ownerId == request.auth.uid
+              && exists(/databases/$(database)/documents/siteMockups/$(mockupId))
+              && get(/databases/$(database)/documents/siteMockups/$(mockupId)).data.ownerId == request.auth.uid
+            )
+            || isPrincipalOwner()
+          );
+
+        allow list: if isVerifiedUser()
+          && (existing().ownerId == request.auth.uid || isPrincipalOwner())
+          && existing().mockupId == mockupId;
+
+        allow create: if isVerifiedUser()
+          && isValidId(mockupId)
+          && isValidId(assetId)
+          && isValidSiteMockupMediaAsset(incoming(), mockupId, assetId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && existsAfter(/databases/$(database)/documents/siteMockups/$(mockupId))
+          && getAfter(/databases/$(database)/documents/siteMockups/$(mockupId)).data.ownerId == request.auth.uid;
+
+        allow update: if isVerifiedUser()
+          && isValidId(mockupId)
+          && isValidId(assetId)
+          && isValidSiteMockupMediaAsset(incoming(), mockupId, assetId)
+          && (
+            isMediaAssetOwnerUpdateAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'label',
+              'category',
+              'slotKey',
+              'dataUrl',
+              'width',
+              'height',
+              'sizeKb',
+              'addedAt',
+              'updatedAt'
+            ])
+          )
+          && exists(/databases/$(database)/documents/siteMockups/$(mockupId))
+          && get(/databases/$(database)/documents/siteMockups/$(mockupId)).data.ownerId == request.auth.uid;
+
+        allow delete: if isVerifiedUser()
+          && isValidId(mockupId)
+          && isValidId(assetId)
+          && (
+            (
+              existing().ownerId == request.auth.uid
+              && exists(/databases/$(database)/documents/siteMockups/$(mockupId))
+              && get(/databases/$(database)/documents/siteMockups/$(mockupId)).data.ownerId == request.auth.uid
+            )
+            || isPrincipalOwner()
+          );
+      }
+    }
+
+    // ---------- Collection: /publicShareLinks/{shareId} ----------
+
+    match /publicShareLinks/{shareId} {
+      // Non-enumerable capability read: public visitors with the exact shareId can only read active, non-expired links.
+      allow get: if isValidId(shareId)
+        && (
+          (
+            resource != null
+            && existing().status == 'active'
+            && existing().expiresAt > request.time
+          )
+          || isPrincipalOwner()
+          || (isVerifiedUser() && resource != null && existing().ownerId == request.auth.uid)
+          || isVerifiedStudioAdmin()
+        );
+
+      // Zero get()/exists() inside list: strictly restricted to Principal Owner (full security scan) or the share owner.
+      allow list: if isVerifiedUser()
+        && (
+          isPrincipalOwner()
+          || ('ownerId' in existing() && existing().ownerId == request.auth.uid)
+        );
+
+      allow create: if isVerifiedUser()
+        && isValidId(shareId)
+        && isValidPublicShareLink(incoming(), shareId)
+        && incoming().status == 'active'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (
+            incoming().ownerId == request.auth.uid
+            && incoming().relinkedFromShareId == ''
+            && incoming().relinkedToShareId == ''
+            && incoming().scrubbedAtIso == ''
+            && incoming().scrubbedFindingCount == 0
+          )
+          || isPrincipalOwner()
+          || isVerifiedStudioAdmin()
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(shareId)
+        && isValidPublicShareLink(incoming(), shareId)
+        && (
+          // Action 1: Owner syncing updated mockup/briefing edits while share is active (terminal states locked)
+          (
+            isPublicShareOwnerSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'title',
+              'subtitle',
+              'note',
+              'ttlHours',
+              'expiresAtIso',
+              'expiresAt',
+              'payload',
+              'updatedAt'
+            ])
+          )
+          // Action 2: Owner revoking their own active share link
+          || (
+            isPublicShareOwnerRevokeAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'updatedAt'
+            ])
+          )
+          // Action 3: Principal Owner or Verified Studio Admin extending, revoking, or scrubbing & re-linking
+          || (
+            isAdminPublicShareGovernanceAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'title',
+              'subtitle',
+              'note',
+              'ttlHours',
+              'expiresAtIso',
+              'expiresAt',
+              'relinkedToShareId',
+              'scrubbedAtIso',
+              'scrubbedFindingCount',
+              'payload',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(shareId)
+        && (
+          (existing().ownerId == request.auth.uid && existing().status != 'scrubbed_relinked')
+          || isPrincipalOwner()
+          || isVerifiedStudioAdmin()
+        );
+    }
+  }
+}

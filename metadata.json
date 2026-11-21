@@ -1,0 +1,8 @@
+{
+  "name": "Dispatch",
+  "description": "Personalized commute audio briefings synthesized from the news articles you provide, with solo anchor or two-host podcast voices and an interactive news editor chat.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,471 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Synchronized Firestore user identity and privilege profile linking Google Sign-In authentication state with studio ownership and role governance.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID matching the Firestore document ID."
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200,
+          "format": "email",
+          "description": "Authenticated account email address."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 140,
+          "description": "Google Sign-In display name."
+        },
+        "photoUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "description": "Google Sign-In profile avatar URL."
+        },
+        "authProvider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Firebase identity provider identifier (e.g., google.com)."
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user email is verified by the identity provider."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["owner", "admin", "member"],
+          "description": "Studio RBAC role synchronized with Cloud SQL and verified principal ownership."
+        },
+        "isOwner": {
+          "type": "boolean",
+          "description": "Explicit ownership privilege flag; true strictly when role is owner for the verified Principal Owner."
+        },
+        "accountStatus": {
+          "type": "string",
+          "enum": ["active", "suspended"],
+          "description": "Studio access status."
+        },
+        "syncSource": {
+          "type": "string",
+          "enum": ["google_signin", "repair_auth", "sync_auth", "admin_governance"],
+          "description": "Origin of the latest profile synchronization or link remediation."
+        },
+        "lastSyncedAtIso": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Client ISO timestamp of the latest synchronization."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp recorded when the profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every synchronization or repair write."
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "photoUrl",
+        "authProvider",
+        "emailVerified",
+        "role",
+        "isOwner",
+        "accountStatus",
+        "syncSource",
+        "lastSyncedAtIso",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SiteMockup": {
+      "title": "SiteMockup",
+      "description": "Synchronized Site Mockup workspace document storing site branding, typography, copy, layout order, and slot media references for an authenticated owner.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the mockup workspace owner."
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Client project identifier."
+        },
+        "sourceUrl": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Imported business website URL."
+        },
+        "lastImportedAt": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "ISO timestamp of the most recent website import."
+        },
+        "clientUpdatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Client ISO timestamp of the latest edit."
+        },
+        "brand": {
+          "type": "object",
+          "description": "Structured site branding map including name, industry, serviceArea, contact details, logoRef, palette, fontMood, and fontPairing."
+        },
+        "brandSwatches": {
+          "type": "array",
+          "description": "Bounded list (max 20) of extracted brand color swatches."
+        },
+        "suggestedFontPairings": {
+          "type": "array",
+          "description": "Bounded list (max 12) of suggested typography pairings."
+        },
+        "hero": {
+          "type": "object",
+          "description": "Hero copy, CTAs, trustHighlights (max 10), and hero photoRef."
+        },
+        "services": {
+          "type": "array",
+          "description": "Bounded list (max 24) of structured service cards."
+        },
+        "projects": {
+          "type": "array",
+          "description": "Bounded list (max 24) of featured project items with photoRef references."
+        },
+        "about": {
+          "type": "object",
+          "description": "About section heading, story, and credentials list (max 20)."
+        },
+        "quoteForm": {
+          "type": "object",
+          "description": "Quote form heading, subtext, and submitLabel."
+        },
+        "sectionVisibility": {
+          "type": "object",
+          "description": "Visibility boolean flags for services, projects, about, and quote sections."
+        },
+        "sectionOrder": {
+          "type": "array",
+          "description": "Ordered list (max 4) of section keys."
+        },
+        "lockedSections": {
+          "type": "object",
+          "description": "Lock boolean map for individual canvas sections."
+        },
+        "siteNotes": {
+          "type": "string",
+          "maxLength": 10000,
+          "description": "Private site notes for the mockup."
+        },
+        "revision": {
+          "type": "number",
+          "description": "Monotonically increasing integer revision counter."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set at creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "ownerId",
+        "projectId",
+        "sourceUrl",
+        "clientUpdatedAt",
+        "brand",
+        "brandSwatches",
+        "suggestedFontPairings",
+        "hero",
+        "services",
+        "projects",
+        "about",
+        "quoteForm",
+        "sectionVisibility",
+        "sectionOrder",
+        "lockedSections",
+        "siteNotes",
+        "revision",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SiteMockupMediaAsset": {
+      "title": "SiteMockupMediaAsset",
+      "description": "Individual compressed media asset belonging to a SiteMockup workspace, stored in a subcollection to keep documents well under the 1MB Firestore limit.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the owner."
+        },
+        "mockupId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable parent SiteMockup document ID."
+        },
+        "assetId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Asset identifier matching the Firestore document ID."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Human-readable asset label."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["logo", "hero", "project", "site-photo"],
+          "description": "Media category classification."
+        },
+        "slotKey": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Optional direct slot binding key (e.g., brand_logo, hero_photo, project_<id>, or collection)."
+        },
+        "dataUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 700000,
+          "description": "Compressed image data URL or HTTPS media URL (strictly bounded under 700KB)."
+        },
+        "width": {
+          "type": "number",
+          "description": "Image pixel width (0 if unknown)."
+        },
+        "height": {
+          "type": "number",
+          "description": "Image pixel height (0 if unknown)."
+        },
+        "sizeKb": {
+          "type": "number",
+          "description": "Estimated asset size in KB."
+        },
+        "addedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO timestamp when the asset was added."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set at creation (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "ownerId",
+        "mockupId",
+        "assetId",
+        "label",
+        "category",
+        "slotKey",
+        "dataUrl",
+        "width",
+        "height",
+        "sizeKb",
+        "addedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PublicShareLink": {
+      "title": "PublicShareLink",
+      "description": "Public-facing capability share link document stored in Firestore for Audio Briefings and Site Mockups, audited by the Owner Console PII & Sensitive Data Scanner.",
+      "type": "object",
+      "properties": {
+        "shareId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Cryptographic capability share identifier matching the Firestore document ID."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["briefing", "mockup"],
+          "description": "Public share link resource kind."
+        },
+        "sharePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Relative public path (/share/{shareId} or /mockup/{shareId})."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "revoked", "scrubbed_relinked"],
+          "description": "Lifecycle status; non-active statuses immediately block public capability reads."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the creator or governing admin."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Public display title of the shared briefing or site mockup."
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 400,
+          "description": "Public subtitle or summary descriptor."
+        },
+        "note": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 400,
+          "description": "Optional public client note attached to the share link."
+        },
+        "ttlHours": {
+          "type": "number",
+          "enum": [24, 72, 168],
+          "description": "Configured time-to-live window in hours."
+        },
+        "createdAtIso": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO-8601 creation timestamp."
+        },
+        "expiresAtIso": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO-8601 expiration timestamp."
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore timestamp enforced by security rules to block expired public reads."
+        },
+        "relinkedFromShareId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Previous compromised shareId when created via Scrub & Re-Link, or empty string."
+        },
+        "relinkedToShareId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Replacement clean shareId when deactivated via Scrub & Re-Link, or empty string."
+        },
+        "scrubbedAtIso": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64,
+          "description": "ISO-8601 timestamp when PII/sensitive payload scrubbing occurred, or empty string."
+        },
+        "scrubbedFindingCount": {
+          "type": "number",
+          "description": "Count of PII or sensitive data findings removed during Scrub & Re-Link (0 if original)."
+        },
+        "payload": {
+          "type": "object",
+          "description": "Structured native map containing the serialized briefing or mockup share payload."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set on creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every write."
+        }
+      },
+      "required": [
+        "shareId",
+        "kind",
+        "sharePath",
+        "status",
+        "ownerId",
+        "title",
+        "subtitle",
+        "note",
+        "ttlHours",
+        "createdAtIso",
+        "expiresAtIso",
+        "expiresAt",
+        "relinkedFromShareId",
+        "relinkedToShareId",
+        "scrubbedAtIso",
+        "scrubbedFindingCount",
+        "payload",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/userProfiles/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "PII-isolated Firestore user identity and privilege profile documents restricted to the profile owner and verified Principal Owner."
+    },
+    "/siteMockups/{mockupId}": {
+      "schema": {
+        "$ref": "#/entities/SiteMockup"
+      },
+      "description": "Owner-scoped Site Mockup workspace documents storing live branding, layout, and copy state."
+    },
+    "/siteMockups/{mockupId}/mediaAssets/{assetId}": {
+      "schema": {
+        "$ref": "#/entities/SiteMockupMediaAsset"
+      },
+      "description": "Subcollection of compressed branding and media assets belonging to a SiteMockup workspace."
+    },
+    "/publicShareLinks/{shareId}": {
+      "schema": {
+        "$ref": "#/entities/PublicShareLink"
+      },
+      "description": "Capability-ID public share link documents with non-enumerable public get, Principal Owner / owner-scoped list auditing, and atomic Scrub & Re-Link support."
+    }
+  }
+}
