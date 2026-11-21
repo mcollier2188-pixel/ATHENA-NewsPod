@@ -602,7 +602,8 @@ export default function App() {
       timeSec: number,
       durSec: number,
       rate: number,
-      forceImmediate = false
+      forceImmediate = false,
+      markCompleted = false
     ) => {
       const now = Date.now();
       if (!forceImmediate && now - lastPlaybackSaveMsRef.current < 1000) {
@@ -613,16 +614,51 @@ export default function App() {
       const safeTime = Number.isFinite(timeSec) && timeSec >= 0 ? timeSec : 0;
       const safeDur = Number.isFinite(durSec) && durSec >= 0 ? durSec : 0;
 
-      const entry: PlaybackPosition = {
-        briefingId,
-        segmentIndex,
-        currentTime: safeTime,
-        duration: safeDur,
-        playbackRate: rate,
-        updatedAt: new Date().toISOString(),
-      };
-
       setPlaybackPositions((prev) => {
+        const existing = prev[briefingId];
+        const targetBriefing =
+          (activeBriefing?.id === briefingId ? activeBriefing : null) ||
+          archive.find((b) => b.id === briefingId);
+
+        let cumulativeSec = safeTime;
+        let totalBriefingSec = 0;
+        if (targetBriefing) {
+          for (let i = 0; i < targetBriefing.segments.length; i++) {
+            const segDur = Math.max(
+              10,
+              Math.round(
+                targetBriefing.segments[i].audioDurationSeconds ||
+                  targetBriefing.segments[i].estimatedSeconds ||
+                  60
+              )
+            );
+            totalBriefingSec += segDur;
+            if (i < segmentIndex) {
+              cumulativeSec += segDur;
+            }
+          }
+        }
+
+        const isCompleted = Boolean(markCompleted || existing?.completed);
+        const maxListenedSeconds = Math.round(
+          Math.max(
+            existing?.maxListenedSeconds ?? 0,
+            cumulativeSec,
+            isCompleted && totalBriefingSec > 0 ? totalBriefingSec : 0
+          )
+        );
+
+        const entry: PlaybackPosition = {
+          briefingId,
+          segmentIndex,
+          currentTime: safeTime,
+          duration: safeDur,
+          playbackRate: rate,
+          updatedAt: new Date().toISOString(),
+          completed: isCompleted,
+          maxListenedSeconds,
+        };
+
         const next = { ...prev, [briefingId]: entry };
         try {
           localStorage.setItem(STORAGE_PLAYBACK_KEY, JSON.stringify(next));
@@ -632,7 +668,7 @@ export default function App() {
         return next;
       });
     },
-    []
+    [activeBriefing, archive]
   );
 
   // Flush playback position when tab hides or closes
@@ -1645,7 +1681,7 @@ export default function App() {
         }
       }
       setCurrentTime(0);
-      persistPlaybackPosition(activeBriefing.id, 0, 0, 0, playbackRate, true);
+      persistPlaybackPosition(activeBriefing.id, 0, 0, 0, playbackRate, true, true);
       return;
     }
 
@@ -1663,10 +1699,10 @@ export default function App() {
         return;
       }
     }
-    // Finished final chapter — reset bookmark to start cleanly next time
+    // Finished final chapter — record 100% completion while resetting bookmark to start cleanly next time
     setIsPlaying(false);
     setCurrentTime(0);
-    persistPlaybackPosition(activeBriefing.id, 0, 0, 0, playbackRate, true);
+    persistPlaybackPosition(activeBriefing.id, 0, 0, 0, playbackRate, true, true);
   }, [
     activeBriefing,
     activeSegmentIndex,

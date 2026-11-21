@@ -11,7 +11,10 @@ import {
 } from '../middleware/auth.ts';
 import type {
   BroadcastFormat,
+  RssClientAppFamily,
+  RssDailyTelemetryBucket,
   RssEpisodeChapterNote,
+  RssFeedAnalyticsSnapshot,
   RssFeedEpisodeSummary,
   RssFeedManifestPublic,
 } from '../types.ts';
@@ -25,7 +28,26 @@ const EPISODE_KEY_PATTERN = /^[a-f0-9]{24}$/;
 const MAX_TITLE_LEN = 120;
 const MAX_DESC_LEN = 600;
 const MAX_AUTHOR_LEN = 100;
+const MIN_PASSWORD_LEN = 4;
+const MAX_PASSWORD_LEN = 128;
 const MAX_EPISODES_PER_FEED = 100;
+const MAX_ANALYTICS_DAYS = 120;
+
+interface StoredRssDailyRecord {
+  downloads: number;
+  rssPolls: number;
+  subscriberHashes: string[];
+}
+
+interface StoredRssAnalytics {
+  daily: Record<string, StoredRssDailyRecord>;
+  episodeDownloads: Record<string, number>;
+  clientBreakdown: Record<RssClientAppFamily, number>;
+  allSubscriberHashes: string[];
+  totalLiveDownloads: number;
+  totalLivePolls: number;
+  lastActivityAt: string | null;
+}
 
 interface StoredRssEpisode {
   briefingId: string;
@@ -53,7 +75,13 @@ interface StoredRssFeedManifest {
   author: string;
   createdAt: string;
   updatedAt: string;
+  expiresAt?: string | null;
+  passwordProtected?: boolean;
+  passwordSalt?: string;
+  passwordHash?: string;
+  accessKeyToken?: string;
   episodes: StoredRssEpisode[];
+  analytics?: StoredRssAnalytics;
 }
 
 export interface RssRouteDependencies {
@@ -96,9 +124,295 @@ function deriveEpisodeKey(briefingId: string): string {
     .slice(0, 24);
 }
 
+function hashFeedPassword(password: string, saltHex: string): string {
+  return crypto.scryptSync(password, saltHex, 32).toString('hex');
+}
+
+function deriveAccessKeyToken(
+  feedToken: string,
+  passwordHashHex: string,
+  manageToken: string
+): string {
+  return crypto
+    .createHmac('sha256', `${manageToken}:${passwordHashHex}`)
+    .update(`dispatch-rss-key:${feedToken}`)
+    .digest('base64url')
+    .slice(0, 24);
+}
+
+function isFeedManifestExpired(manifest: StoredRssFeedManifest): boolean {
+  if (!manifest.expiresAt) return false;
+  const expMs = new Date(manifest.expiresAt).getTime();
+  if (Number.isNaN(expMs)) return false;
+  return Date.now() > expMs;
+}
+
+function getUtcDateKey(date = new Date()): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function deriveSubscriberFingerprint(req: Request, feedId: string): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  const rawIp =
+    (typeof forwarded === 'string'
+      ? forwarded.split(',')[0].trim()
+      : Array.isArray(forwarded)
+        ? forwarded[0]
+        : '') ||
+    req.socket?.remoteAddress ||
+    'local';
+  const ua = String(req.headers['user-agent'] || 'rss-reader').slice(0, 200);
+  return crypto
+    .createHash('sha256')
+    .update(`dispatch-sub:${feedId}:${rawIp}:${ua}`)
+    .digest('hex')
+    .slice(0, 12);
+}
+
+function classifyPodcastClient(req: Request): RssClientAppFamily {
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  if (
+    ua.includes('applecoremedia') ||
+    ua.includes('podcasts/') ||
+    ua.includes('itunes') ||
+    ua.includes('cfnetwork')
+  ) {
+    return 'Apple Podcasts';
+  }
+  if (ua.includes('overcast')) {
+    return 'Overcast';
+  }
+  if (ua.includes('pocket casts') || ua.includes('pocketcasts') || ua.includes('shifty jelly')) {
+    return 'Pocket Casts';
+  }
+  return 'Direct & Web RSS';
+}
+
+function ensureFeedAnalytics(manifest: StoredRssFeedManifest): StoredRssAnalytics {
+  if (!manifest.analytics) {
+    manifest.analytics = {
+      daily: {},
+      episodeDownloads: {},
+      clientBreakdown: {
+        'Apple Podcasts': 0,
+        Overcast: 0,
+        'Pocket Casts': 0,
+        'Direct & Web RSS': 0,
+      },
+      allSubscriberHashes: [],
+      totalLiveDownloads: 0,
+      totalLivePolls: 0,
+      lastActivityAt: null,
+    };
+  }
+  return manifest.analytics;
+}
+
+function pruneAnalyticsDays(daily: Record<string, StoredRssDailyRecord>): void {
+  const keys = Object.keys(daily).sort();
+  if (keys.length <= MAX_ANALYTICS_DAYS) return;
+  const toRemove = keys.slice(0, keys.length - MAX_ANALYTICS_DAYS);
+  for (const key of toRemove) {
+    delete daily[key];
+  }
+}
+
+async function recordRssPollEvent(
+  req: Request,
+  manifest: StoredRssFeedManifest
+): Promise<void> {
+  try {
+    const analytics = ensureFeedAnalytics(manifest);
+    const todayKey = getUtcDateKey();
+    const subHash = deriveSubscriberFingerprint(req, manifest.feedId);
+    const clientFamily = classifyPodcastClient(req);
+
+    if (!analytics.daily[todayKey]) {
+      analytics.daily[todayKey] = {
+        downloads: 0,
+        rssPolls: 0,
+        subscriberHashes: [],
+      };
+    }
+
+    const bucket = analytics.daily[todayKey];
+    bucket.rssPolls += 1;
+    if (!bucket.subscriberHashes.includes(subHash) && bucket.subscriberHashes.length < 5000) {
+      bucket.subscriberHashes.push(subHash);
+    }
+    if (
+      !analytics.allSubscriberHashes.includes(subHash) &&
+      analytics.allSubscriberHashes.length < 10000
+    ) {
+      analytics.allSubscriberHashes.push(subHash);
+    }
+
+    analytics.totalLivePolls += 1;
+    analytics.clientBreakdown[clientFamily] =
+      (analytics.clientBreakdown[clientFamily] || 0) + 1;
+    analytics.lastActivityAt = new Date().toISOString();
+
+    pruneAnalyticsDays(analytics.daily);
+    await writeFeedManifest(manifest);
+  } catch {
+    // Telemetry writes should never block RSS feed delivery
+  }
+}
+
+async function recordEpisodeDownloadEvent(
+  req: Request,
+  manifest: StoredRssFeedManifest,
+  briefingId: string
+): Promise<void> {
+  try {
+    const analytics = ensureFeedAnalytics(manifest);
+    const todayKey = getUtcDateKey();
+    const subHash = deriveSubscriberFingerprint(req, manifest.feedId);
+    const clientFamily = classifyPodcastClient(req);
+
+    if (!analytics.daily[todayKey]) {
+      analytics.daily[todayKey] = {
+        downloads: 0,
+        rssPolls: 0,
+        subscriberHashes: [],
+      };
+    }
+
+    const bucket = analytics.daily[todayKey];
+    bucket.downloads += 1;
+    if (!bucket.subscriberHashes.includes(subHash) && bucket.subscriberHashes.length < 5000) {
+      bucket.subscriberHashes.push(subHash);
+    }
+    if (
+      !analytics.allSubscriberHashes.includes(subHash) &&
+      analytics.allSubscriberHashes.length < 10000
+    ) {
+      analytics.allSubscriberHashes.push(subHash);
+    }
+
+    analytics.totalLiveDownloads += 1;
+    analytics.episodeDownloads[briefingId] =
+      (analytics.episodeDownloads[briefingId] || 0) + 1;
+    analytics.clientBreakdown[clientFamily] =
+      (analytics.clientBreakdown[clientFamily] || 0) + 1;
+    analytics.lastActivityAt = new Date().toISOString();
+
+    pruneAnalyticsDays(analytics.daily);
+    await writeFeedManifest(manifest);
+  } catch {
+    // Telemetry writes should never block audio delivery
+  }
+}
+
+function buildAnalyticsSnapshot(
+  manifest: StoredRssFeedManifest
+): RssFeedAnalyticsSnapshot {
+  const analytics = ensureFeedAnalytics(manifest);
+  const dailyBuckets: RssDailyTelemetryBucket[] = Object.entries(analytics.daily)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, rec]) => ({
+      date,
+      subscribers: rec.subscriberHashes.length,
+      downloads: rec.downloads,
+      rssPolls: rec.rssPolls,
+    }));
+
+  return {
+    feedId: manifest.feedId,
+    totalLiveDownloads: analytics.totalLiveDownloads,
+    totalLivePolls: analytics.totalLivePolls,
+    uniqueLiveSubscribers: analytics.allSubscriberHashes.length,
+    dailyBuckets,
+    episodeDownloads: { ...analytics.episodeDownloads },
+    clientBreakdown: {
+      'Apple Podcasts': analytics.clientBreakdown['Apple Podcasts'] || 0,
+      Overcast: analytics.clientBreakdown.Overcast || 0,
+      'Pocket Casts': analytics.clientBreakdown['Pocket Casts'] || 0,
+      'Direct & Web RSS': analytics.clientBreakdown['Direct & Web RSS'] || 0,
+    },
+    lastActivityAt: analytics.lastActivityAt,
+  };
+}
+
+function verifyFeedPasswordOrAccessKey(
+  req: Request,
+  manifest: StoredRssFeedManifest,
+  safeTimingEqual: (a?: string, b?: string) => boolean
+): { authorized: boolean; usedQueryKey?: string } {
+  if (
+    !manifest.passwordProtected ||
+    !manifest.passwordSalt ||
+    !manifest.passwordHash
+  ) {
+    return { authorized: true };
+  }
+
+  // 1. Check optional signed access key (?key=...) for podcast apps without Basic Auth UI
+  const rawQueryKey = req.query.key;
+  const queryKey =
+    typeof rawQueryKey === 'string' ? rawQueryKey.trim() : '';
+  if (
+    queryKey &&
+    manifest.accessKeyToken &&
+    safeTimingEqual(queryKey, manifest.accessKeyToken)
+  ) {
+    return { authorized: true, usedQueryKey: queryKey };
+  }
+
+  // 2. Check standard HTTP Basic Auth header (Authorization: Basic base64(user:pass))
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Basic ')) {
+    const b64 = authHeader.slice('Basic '.length).trim();
+    if (b64) {
+      try {
+        const decoded = Buffer.from(b64, 'base64').toString('utf8');
+        const colonIdx = decoded.indexOf(':');
+        // Allow either "username:password" or bare "password"
+        const candidatePassword =
+          colonIdx >= 0 ? decoded.slice(colonIdx + 1) : decoded;
+        if (
+          candidatePassword.length > 0 &&
+          candidatePassword.length <= MAX_PASSWORD_LEN
+        ) {
+          const candidateHash = hashFeedPassword(
+            candidatePassword,
+            manifest.passwordSalt
+          );
+          if (safeTimingEqual(candidateHash, manifest.passwordHash)) {
+            return { authorized: true };
+          }
+        }
+      } catch {
+        // Malformed base64 header
+      }
+    }
+  }
+
+  return { authorized: false };
+}
+
+function normalizeExpiresAtInput(
+  rawExpiresAt: unknown
+): { valid: boolean; value: string | null; error?: string } {
+  if (rawExpiresAt === null || rawExpiresAt === '') {
+    return { valid: true, value: null };
+  }
+  if (typeof rawExpiresAt !== 'string') {
+    return { valid: false, value: null, error: 'Invalid expiration date format.' };
+  }
+  const d = new Date(rawExpiresAt);
+  if (Number.isNaN(d.getTime())) {
+    return { valid: false, value: null, error: 'Provide a valid expiration date and time.' };
+  }
+  return { valid: true, value: d.toISOString() };
+}
+
 function parseWavDurationSeconds(buf: Buffer): number {
   if (buf.length < 44) return 0;
-  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
+  if (
+    buf.toString('ascii', 0, 4) !== 'RIFF' ||
+    buf.toString('ascii', 8, 12) !== 'WAVE'
+  ) {
     return 0;
   }
   let byteRate = 0;
@@ -155,7 +469,8 @@ function resolvePublicOrigin(req: Request): string {
       : req.protocol || 'https';
   const proto = protoCandidate === 'http' ? 'http' : 'https';
 
-  const rawHost = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const rawHost =
+    req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
   const hostCandidate = (
     Array.isArray(rawHost) ? rawHost[0] : String(rawHost).split(',')[0]
   )
@@ -166,9 +481,15 @@ function resolvePublicOrigin(req: Request): string {
   return `${proto}://${host}`;
 }
 
-function buildPublicManifest(manifest: StoredRssFeedManifest): RssFeedManifestPublic {
+function buildPublicManifest(
+  manifest: StoredRssFeedManifest
+): RssFeedManifestPublic {
   const sortedEpisodes = [...manifest.episodes].sort(
-    (a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
+    (a, b) =>
+      new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
+  );
+  const isProtected = Boolean(
+    manifest.passwordProtected && manifest.passwordHash
   );
   return {
     feedId: manifest.feedId,
@@ -180,10 +501,16 @@ function buildPublicManifest(manifest: StoredRssFeedManifest): RssFeedManifestPu
     author: manifest.author,
     createdAt: manifest.createdAt,
     updatedAt: manifest.updatedAt,
-    episodes: sortedEpisodes.map((ep): RssFeedEpisodeSummary => ({
-      ...ep,
-      audioPath: `/api/rss/${manifest.feedToken}/episodes/${ep.episodeKey}.wav`,
-    })),
+    expiresAt: manifest.expiresAt ?? null,
+    isExpired: isFeedManifestExpired(manifest),
+    passwordProtected: isProtected,
+    accessKeyToken: isProtected ? manifest.accessKeyToken : undefined,
+    episodes: sortedEpisodes.map(
+      (ep): RssFeedEpisodeSummary => ({
+        ...ep,
+        audioPath: `/api/rss/${manifest.feedToken}/episodes/${ep.episodeKey}.wav`,
+      })
+    ),
   };
 }
 
@@ -195,7 +522,10 @@ function resolveFeedDir(feedId: string): string | null {
   return resolvedDir;
 }
 
-function resolveEpisodeWavPath(feedDir: string, episodeKey: string): string | null {
+function resolveEpisodeWavPath(
+  feedDir: string,
+  episodeKey: string
+): string | null {
   if (!EPISODE_KEY_PATTERN.test(episodeKey)) return null;
   const resolvedDir = path.resolve(feedDir);
   const resolvedWav = path.resolve(resolvedDir, `ep-${episodeKey}.wav`);
@@ -223,7 +553,9 @@ async function writeTokenIndex(index: Record<string, string>): Promise<void> {
   await fs.rename(tmpFile, TOKEN_INDEX_FILE);
 }
 
-async function readFeedManifest(feedId: string): Promise<StoredRssFeedManifest | null> {
+async function readFeedManifest(
+  feedId: string
+): Promise<StoredRssFeedManifest | null> {
   const dir = resolveFeedDir(feedId);
   if (!dir) return null;
   try {
@@ -234,7 +566,9 @@ async function readFeedManifest(feedId: string): Promise<StoredRssFeedManifest |
   }
 }
 
-async function writeFeedManifest(manifest: StoredRssFeedManifest): Promise<void> {
+async function writeFeedManifest(
+  manifest: StoredRssFeedManifest
+): Promise<void> {
   const dir = resolveFeedDir(manifest.feedId);
   if (!dir) throw new Error('Invalid feed identifier.');
   await fs.mkdir(dir, { recursive: true });
@@ -349,16 +683,24 @@ function buildEpisodeHtmlShowNotes(ep: StoredRssEpisode): string {
   return blocks.join('\n');
 }
 
-function buildRssXml(manifest: StoredRssFeedManifest, origin: string): string {
-  const selfUrl = `${origin}/api/rss/${manifest.feedToken}.xml`;
+function buildRssXml(
+  manifest: StoredRssFeedManifest,
+  origin: string,
+  propagatedKey?: string
+): string {
+  const keySuffix = propagatedKey
+    ? `?key=${encodeURIComponent(propagatedKey)}`
+    : '';
+  const selfUrl = `${origin}/api/rss/${manifest.feedToken}.xml${keySuffix}`;
   const coverUrl = `${origin}/api/rss/cover.png`;
   const sortedEpisodes = [...manifest.episodes].sort(
-    (a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
+    (a, b) =>
+      new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
   );
 
   const itemsXml = sortedEpisodes
     .map((ep) => {
-      const enclosureUrl = `${origin}/api/rss/${manifest.feedToken}/episodes/${ep.episodeKey}.wav`;
+      const enclosureUrl = `${origin}/api/rss/${manifest.feedToken}/episodes/${ep.episodeKey}.wav${keySuffix}`;
       const plainNotes = buildEpisodePlainShowNotes(ep);
       const htmlNotes = buildEpisodeHtmlShowNotes(ep);
       const guid = `dispatch:briefing:${ep.briefingId}`;
@@ -448,7 +790,6 @@ function getPodcastCoverPng(): Buffer {
   const stride = size * 3 + 1;
   const raw = Buffer.alloc(stride * size);
 
-  // Waveform bar heights (15 editorial mirrored bars in the center)
   const barHeights = [
     48, 86, 128, 72, 168, 224, 146, 256, 152, 212, 118, 174, 96, 122, 56,
   ];
@@ -461,9 +802,8 @@ function getPodcastCoverPng(): Buffer {
 
   for (let y = 0; y < size; y++) {
     const rowStart = y * stride;
-    raw[rowStart] = 0; // filter type: None
+    raw[rowStart] = 0;
     for (let x = 0; x < size; x++) {
-      // Base dark obsidian #0B0D10 with subtle radial cyan editorial glow
       const dx = (x - size / 2) / (size / 2);
       const dy = (y - size / 2) / (size / 2);
       const distSq = dx * dx + dy * dy;
@@ -473,7 +813,6 @@ function getPodcastCoverPng(): Buffer {
       let g = Math.round(13 + glow * 26);
       let b = Math.round(16 + glow * 34);
 
-      // Subtle editorial outer frame hairline at 32px inset
       const onBorder =
         (x === 32 || x === size - 33) && y >= 32 && y <= size - 33
           ? true
@@ -484,14 +823,12 @@ function getPodcastCoverPng(): Buffer {
         b = 132;
       }
 
-      // Subtle center horizon rule
       if (y === centerY && x >= 68 && x <= size - 68) {
         r = 30;
         g = 62;
         b = 76;
       }
 
-      // Cyan editorial mirrored waveform bars
       if (x >= barsStartX && x < barsStartX + totalBarsWidth) {
         const relX = x - barsStartX;
         const slot = barWidth + barGap;
@@ -518,8 +855,8 @@ function getPodcastCoverPng(): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // RGB color type
+  ihdr[8] = 8;
+  ihdr[9] = 2;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -536,10 +873,13 @@ function getPodcastCoverPng(): Buffer {
   return cachedCoverPng;
 }
 
-export function registerRssRoutes(app: Express, deps: RssRouteDependencies): void {
+export function registerRssRoutes(
+  app: Express,
+  deps: RssRouteDependencies
+): void {
   const { stitchServerWavBuffers, safeTimingEqual, formatApiError } = deps;
 
-  // Podcast artwork PNG endpoint (public static cover for podcast apps)
+  // Podcast artwork PNG endpoint
   app.get('/api/rss/cover.png', (_req, res) => {
     const png = getPodcastCoverPng();
     res.writeHead(200, {
@@ -560,13 +900,15 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     res.end();
   });
 
-  // 1. Create a new private RSS podcast feed
+  // 1. Create a new private RSS podcast feed (with optional expiration & password protection)
   app.post('/api/rss/feeds', optionalAuth, async (req: AuthRequest, res) => {
     try {
       const body = (req.body || {}) as {
         title?: string;
         description?: string;
         author?: string;
+        expiresAt?: string | null;
+        password?: string | null;
       };
 
       const title =
@@ -585,10 +927,39 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         (typeof req.user?.name === 'string' && req.user.name.trim()) ||
         'Dispatch Personal Audio';
 
+      let expiresAt: string | null = null;
+      if (body.expiresAt !== undefined && body.expiresAt !== null && body.expiresAt !== '') {
+        const expCheck = normalizeExpiresAtInput(body.expiresAt);
+        if (!expCheck.valid) {
+          res.status(400).json({ error: expCheck.error });
+          return;
+        }
+        expiresAt = expCheck.value;
+      }
+
       const feedId = crypto.randomBytes(9).toString('base64url');
       const feedToken = crypto.randomBytes(24).toString('base64url');
       const manageToken = crypto.randomBytes(24).toString('base64url');
       const nowIso = new Date().toISOString();
+
+      let passwordProtected = false;
+      let passwordSalt: string | undefined;
+      let passwordHash: string | undefined;
+      let accessKeyToken: string | undefined;
+
+      if (typeof body.password === 'string' && body.password.trim().length > 0) {
+        const cleanPass = body.password.trim();
+        if (cleanPass.length < MIN_PASSWORD_LEN || cleanPass.length > MAX_PASSWORD_LEN) {
+          res.status(400).json({
+            error: `Password must be between ${MIN_PASSWORD_LEN} and ${MAX_PASSWORD_LEN} characters.`,
+          });
+          return;
+        }
+        passwordSalt = crypto.randomBytes(16).toString('hex');
+        passwordHash = hashFeedPassword(cleanPass, passwordSalt);
+        accessKeyToken = deriveAccessKeyToken(feedToken, passwordHash, manageToken);
+        passwordProtected = true;
+      }
 
       const manifest: StoredRssFeedManifest = {
         feedId,
@@ -601,6 +972,11 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         author,
         createdAt: nowIso,
         updatedAt: nowIso,
+        expiresAt,
+        passwordProtected,
+        passwordSalt,
+        passwordHash,
+        accessKeyToken,
         episodes: [],
       };
 
@@ -629,7 +1005,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         return;
       }
       if (!canManageFeed(req, manifest, safeTimingEqual)) {
-        res.status(403).json({ error: 'Not authorized to access this private RSS feed.' });
+        res.status(403).json({
+          error: 'Not authorized to access this private RSS feed.',
+        });
         return;
       }
       res.json({ feed: buildPublicManifest(manifest) });
@@ -639,7 +1017,7 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     }
   });
 
-  // 3. Update feed title / description / author
+  // 3. Update feed title / description / author / expiration / password protection
   app.patch('/api/rss/feeds/:feedId', optionalAuth, async (req: AuthRequest, res) => {
     try {
       const { feedId } = req.params;
@@ -649,7 +1027,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         return;
       }
       if (!canManageFeed(req, manifest, safeTimingEqual)) {
-        res.status(403).json({ error: 'Not authorized to update this private RSS feed.' });
+        res.status(403).json({
+          error: 'Not authorized to update this private RSS feed.',
+        });
         return;
       }
 
@@ -657,6 +1037,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         title?: string;
         description?: string;
         author?: string;
+        expiresAt?: string | null;
+        passwordProtected?: boolean;
+        password?: string | null;
       };
 
       if (typeof body.title === 'string') {
@@ -671,8 +1054,52 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         const trimmed = body.author.trim().slice(0, MAX_AUTHOR_LEN);
         if (trimmed) manifest.author = trimmed;
       }
-      manifest.updatedAt = new Date().toISOString();
 
+      // Handle expiration updates
+      if ('expiresAt' in body) {
+        const expCheck = normalizeExpiresAtInput(body.expiresAt);
+        if (!expCheck.valid) {
+          res.status(400).json({ error: expCheck.error });
+          return;
+        }
+        manifest.expiresAt = expCheck.value;
+      }
+
+      // Handle password protection updates
+      if (body.passwordProtected === false) {
+        manifest.passwordProtected = false;
+        delete manifest.passwordSalt;
+        delete manifest.passwordHash;
+        delete manifest.accessKeyToken;
+      } else if (typeof body.password === 'string') {
+        const cleanPass = body.password.trim();
+        if (
+          cleanPass.length < MIN_PASSWORD_LEN ||
+          cleanPass.length > MAX_PASSWORD_LEN
+        ) {
+          res.status(400).json({
+            error: `Password must be between ${MIN_PASSWORD_LEN} and ${MAX_PASSWORD_LEN} characters.`,
+          });
+          return;
+        }
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hash = hashFeedPassword(cleanPass, salt);
+        manifest.passwordSalt = salt;
+        manifest.passwordHash = hash;
+        manifest.accessKeyToken = deriveAccessKeyToken(
+          manifest.feedToken,
+          hash,
+          manifest.manageToken
+        );
+        manifest.passwordProtected = true;
+      } else if (body.passwordProtected === true && !manifest.passwordHash) {
+        res.status(400).json({
+          error: 'Provide a password to enable password protection.',
+        });
+        return;
+      }
+
+      manifest.updatedAt = new Date().toISOString();
       await writeFeedManifest(manifest);
       res.json({ feed: buildPublicManifest(manifest) });
     } catch (err) {
@@ -699,7 +1126,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
           return;
         }
         if (!canManageFeed(req, manifest, safeTimingEqual)) {
-          res.status(403).json({ error: 'Not authorized to sync episodes to this feed.' });
+          res.status(403).json({
+            error: 'Not authorized to sync episodes to this feed.',
+          });
           return;
         }
 
@@ -728,7 +1157,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         };
 
         if (!Array.isArray(body.segments) || body.segments.length === 0) {
-          res.status(400).json({ error: 'Provide at least one briefing chapter to sync.' });
+          res.status(400).json({
+            error: 'Provide at least one briefing chapter to sync.',
+          });
           return;
         }
 
@@ -738,7 +1169,10 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
 
         for (let i = 0; i < body.segments.length; i++) {
           const seg = body.segments[i];
-          if (typeof seg.audioBase64 !== 'string' || seg.audioBase64.length < 64) {
+          if (
+            typeof seg.audioBase64 !== 'string' ||
+            seg.audioBase64.length < 64
+          ) {
             continue;
           }
           const wavBuf = Buffer.from(seg.audioBase64, 'base64');
@@ -759,20 +1193,22 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
           });
 
           wavBuffers.push(wavBuf);
-          // Account for the 0.35s editorial pause inserted by stitchServerWavBuffers
           cursorSeconds += parsedDur + 0.35;
         }
 
         if (wavBuffers.length === 0) {
           res.status(400).json({
-            error: 'This briefing has no recorded audio segments to publish yet.',
+            error:
+              'This briefing has no recorded audio segments to publish yet.',
           });
           return;
         }
 
         const stitchedWav = stitchServerWavBuffers(wavBuffers);
         if (!stitchedWav || stitchedWav.length < 44) {
-          res.status(400).json({ error: 'Unable to stitch recorded chapter audio.' });
+          res.status(400).json({
+            error: 'Unable to stitch recorded chapter audio.',
+          });
           return;
         }
 
@@ -866,12 +1302,16 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
           return;
         }
         if (!canManageFeed(req, manifest, safeTimingEqual)) {
-          res.status(403).json({ error: 'Not authorized to modify this private RSS feed.' });
+          res.status(403).json({
+            error: 'Not authorized to modify this private RSS feed.',
+          });
           return;
         }
 
         const feedDir = resolveFeedDir(feedId);
-        const existing = manifest.episodes.find((ep) => ep.briefingId === briefingId);
+        const existing = manifest.episodes.find(
+          (ep) => ep.briefingId === briefingId
+        );
         if (existing && feedDir) {
           const wavPath = resolveEpisodeWavPath(feedDir, existing.episodeKey);
           if (wavPath) {
@@ -892,7 +1332,7 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     }
   );
 
-  // 6. Regenerate private RSS feed URL token (immediately revokes old URL)
+  // 6. Regenerate private RSS feed URL token (immediately revokes old URL & rotates signed key)
   app.post(
     '/api/rss/feeds/:feedId/regenerate',
     optionalAuth,
@@ -905,13 +1345,22 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
           return;
         }
         if (!canManageFeed(req, manifest, safeTimingEqual)) {
-          res.status(403).json({ error: 'Not authorized to regenerate this RSS feed URL.' });
+          res.status(403).json({
+            error: 'Not authorized to regenerate this RSS feed URL.',
+          });
           return;
         }
 
         const oldToken = manifest.feedToken;
         const nextToken = crypto.randomBytes(24).toString('base64url');
         manifest.feedToken = nextToken;
+        if (manifest.passwordProtected && manifest.passwordHash) {
+          manifest.accessKeyToken = deriveAccessKeyToken(
+            nextToken,
+            manifest.passwordHash,
+            manifest.manageToken
+          );
+        }
         manifest.updatedAt = new Date().toISOString();
 
         await writeFeedManifest(manifest);
@@ -928,17 +1377,61 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     }
   );
 
-  // 7. Public token-gated RSS 2.0 + Apple Podcasts XML endpoint
-  const handleRssXmlRequest = async (req: Request, res: Response, isHead: boolean) => {
+  // 7. Public token-gated RSS 2.0 + Apple Podcasts XML endpoint (enforces expiration & password)
+  const handleRssXmlRequest = async (
+    req: Request,
+    res: Response,
+    isHead: boolean
+  ) => {
     const token = req.params.token;
     const found = await resolveFeedByToken(token, safeTimingEqual);
     if (!found) {
-      res.status(404).type('text/plain').send('Private podcast feed not found or URL has been regenerated.');
+      res
+        .status(404)
+        .type('text/plain')
+        .send(
+          'Private podcast feed not found or URL has been regenerated.'
+        );
+      return;
+    }
+
+    // Check expiration gate (410 Gone)
+    if (isFeedManifestExpired(found.manifest)) {
+      res
+        .status(410)
+        .type('text/plain')
+        .send(
+          'This private podcast RSS feed link has expired. Reactivate or extend the expiration date in Dispatch Archive > Export as RSS.'
+        );
+      return;
+    }
+
+    // Check password / signed access key gate (401 Unauthorized + WWW-Authenticate)
+    const authResult = verifyFeedPasswordOrAccessKey(
+      req,
+      found.manifest,
+      safeTimingEqual
+    );
+    if (!authResult.authorized) {
+      res.setHeader(
+        'WWW-Authenticate',
+        'Basic realm="Dispatch Private Podcast Feed", charset="UTF-8"'
+      );
+      res
+        .status(401)
+        .type('text/plain')
+        .send(
+          'Password required for this private podcast RSS feed. Enter any username and your feed password, or use the signed app access key URL.'
+        );
       return;
     }
 
     const origin = resolvePublicOrigin(req);
-    const xml = buildRssXml(found.manifest, origin);
+    const xml = buildRssXml(
+      found.manifest,
+      origin,
+      authResult.usedQueryKey
+    );
     const buf = Buffer.from(xml, 'utf8');
     const etag = `"${crypto.createHash('sha256').update(buf).digest('hex').slice(0, 20)}"`;
 
@@ -964,6 +1457,7 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
       res.end();
     } else {
       res.end(buf);
+      void recordRssPollEvent(req, found.manifest);
     }
   };
 
@@ -975,7 +1469,35 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     void handleRssXmlRequest(req, res, true);
   });
 
-  // 8. Public token-gated stitched episode WAV endpoint with HTTP Range + HEAD support
+  // 7b. Authenticated Feed Performance Analytics Snapshot endpoint
+  app.get(
+    '/api/rss/feeds/:feedId/analytics',
+    optionalAuth,
+    async (req: AuthRequest, res) => {
+      try {
+        const { feedId } = req.params;
+        const manifest = await readFeedManifest(feedId);
+        if (!manifest) {
+          res.status(404).json({ error: 'Private RSS feed not found.' });
+          return;
+        }
+        if (!canManageFeed(req, manifest, safeTimingEqual)) {
+          res.status(403).json({
+            error: 'Not authorized to inspect analytics for this private RSS feed.',
+          });
+          return;
+        }
+        res.json({
+          analytics: buildAnalyticsSnapshot(manifest),
+        });
+      } catch (err) {
+        const { status, message } = formatApiError(err);
+        res.status(status).json({ error: message });
+      }
+    }
+  );
+
+  // 8. Public token-gated stitched episode WAV endpoint (enforces expiration, password, & HTTP Range)
   const handleEpisodeAudioRequest = async (
     req: Request,
     res: Response,
@@ -984,7 +1506,33 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
     const { token, episodeKey } = req.params;
     const found = await resolveFeedByToken(token, safeTimingEqual);
     if (!found) {
-      res.status(404).json({ error: 'Private podcast feed not found or revoked.' });
+      res
+        .status(404)
+        .json({ error: 'Private podcast feed not found or revoked.' });
+      return;
+    }
+
+    if (isFeedManifestExpired(found.manifest)) {
+      res.status(410).json({
+        error: 'This private podcast feed link has expired.',
+        expired: true,
+      });
+      return;
+    }
+
+    const authResult = verifyFeedPasswordOrAccessKey(
+      req,
+      found.manifest,
+      safeTimingEqual
+    );
+    if (!authResult.authorized) {
+      res.setHeader(
+        'WWW-Authenticate',
+        'Basic realm="Dispatch Private Podcast Feed", charset="UTF-8"'
+      );
+      res.status(401).json({
+        error: 'Password required to stream this private podcast episode.',
+      });
       return;
     }
 
@@ -992,7 +1540,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
       (ep) => ep.episodeKey === episodeKey
     );
     if (!episode) {
-      res.status(404).json({ error: 'Episode not found in this private feed.' });
+      res
+        .status(404)
+        .json({ error: 'Episode not found in this private feed.' });
       return;
     }
 
@@ -1037,7 +1587,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
           end = totalSize - 1;
         } else {
           start = Number(match[1]);
-          end = match[2] ? Math.min(Number(match[2]), totalSize - 1) : totalSize - 1;
+          end = match[2]
+            ? Math.min(Number(match[2]), totalSize - 1)
+            : totalSize - 1;
         }
 
         if (
@@ -1067,6 +1619,9 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
             'X-Robots-Tag': 'noindex, nofollow',
           });
           res.end(slice);
+          if (start === 0) {
+            void recordEpisodeDownloadEvent(req, found.manifest, episode.briefingId);
+          }
         } finally {
           await handle.close();
         }
@@ -1083,6 +1638,7 @@ export function registerRssRoutes(app: Express, deps: RssRouteDependencies): voi
         'X-Robots-Tag': 'noindex, nofollow',
       });
       res.end(fullBuf);
+      void recordEpisodeDownloadEvent(req, found.manifest, episode.briefingId);
     } catch {
       res.status(404).json({ error: 'Episode audio file is unavailable.' });
     }

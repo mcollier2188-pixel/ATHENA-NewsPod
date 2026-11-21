@@ -536,6 +536,46 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidFeedAlertAcknowledgment(data, ackId) {
+      return data.keys().hasAll([
+        'ackId',
+        'ownerId',
+        'feedId',
+        'alertKey',
+        'eventType',
+        'acknowledged',
+        'acknowledgedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ackId',
+        'ownerId',
+        'feedId',
+        'alertKey',
+        'eventType',
+        'acknowledged',
+        'acknowledgedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.ackId)
+      && data.ackId == ackId
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isValidId(data.feedId)
+      && isBoundedString(data.alertKey, 1, 160)
+      && data.eventType in ['organic', 'test']
+      && data.acknowledged is bool
+      && isBoundedString(data.acknowledgedAtIso, 0, 64)
+      && (
+        (data.acknowledged == true && data.acknowledgedAtIso.size() >= 1)
+        || (data.acknowledged == false && data.acknowledgedAtIso.size() == 0)
+      )
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
     // ---------- Action Helpers for Updates ----------
 
     function isSelfProfileMetadataSyncAction(userId) {
@@ -626,6 +666,17 @@ service cloud.firestore {
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
         && incoming().createdAtIso == existing().createdAtIso
+        && incoming().updatedAt == request.time;
+    }
+
+    function isFeedAlertAckOwnerToggleAction() {
+      return isOwner(existing().ownerId)
+        && incoming().ackId == existing().ackId
+        && incoming().ownerId == existing().ownerId
+        && incoming().feedId == existing().feedId
+        && incoming().alertKey == existing().alertKey
+        && incoming().eventType == existing().eventType
+        && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time;
     }
 
@@ -925,6 +976,63 @@ service cloud.firestore {
           (existing().ownerId == request.auth.uid && existing().status != 'scrubbed_relinked')
           || isPrincipalOwner()
           || isVerifiedStudioAdmin()
+        );
+    }
+
+    // ---------- Collection: /feedAlertAcknowledgments/{ackId} ----------
+
+    match /feedAlertAcknowledgments/{ackId} {
+      allow get: if isVerifiedUser()
+        && isValidId(ackId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (ackId.matches('^ack_' + request.auth.uid + '_[a-zA-Z0-9_\\-]+$') || isPrincipalOwner()))
+        );
+
+      // Zero get()/exists() inside list: strictly enforces owner-scoped where('ownerId', '==', request.auth.uid) queries
+      allow list: if isVerifiedUser()
+        && (
+          isPrincipalOwner()
+          || ('ownerId' in existing() && existing().ownerId == request.auth.uid)
+        );
+
+      allow create: if isVerifiedUser()
+        && isValidId(ackId)
+        && isValidFeedAlertAcknowledgment(incoming(), ackId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(ackId)
+        && isValidFeedAlertAcknowledgment(incoming(), ackId)
+        && (
+          (
+            isFeedAlertAckOwnerToggleAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'acknowledged',
+              'acknowledgedAtIso',
+              'updatedAt'
+            ])
+          )
+          || (
+            isPrincipalOwner()
+            && incoming().ackId == existing().ackId
+            && incoming().ownerId == existing().ownerId
+            && incoming().createdAt == existing().createdAt
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'acknowledged',
+              'acknowledgedAtIso',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(ackId)
+        && (
+          (resource != null && existing().ownerId == request.auth.uid)
+          || isPrincipalOwner()
         );
     }
   }

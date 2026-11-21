@@ -446,4 +446,139 @@ test('PublicShareLinks Security: non-enumerable capability get, list guard, and 
   assert.equal(evaluateShareList(ownerAuth, 'uid_bob'), true);
 });
 
+test('FeedAlertAcknowledgments Security: owner isolation, state-timestamp invariant, and immutable identity on toggle', () => {
+  assert.match(rulesText, /match \/feedAlertAcknowledgments\/\{ackId\}/);
+  assert.match(rulesText, /isValidFeedAlertAcknowledgment\(incoming\(\), ackId\)/);
+  assert.match(rulesText, /isFeedAlertAckOwnerToggleAction\(\)/);
+
+  interface AckPayload {
+    ackId: string;
+    ownerId: string;
+    feedId: string;
+    alertKey: string;
+    eventType: string;
+    acknowledged: boolean;
+    acknowledgedAtIso: string;
+    createdAt: number;
+    updatedAt: number;
+    [extraKey: string]: unknown;
+  }
+
+  const ACK_KEYS = new Set([
+    'ackId',
+    'ownerId',
+    'feedId',
+    'alertKey',
+    'eventType',
+    'acknowledged',
+    'acknowledgedAtIso',
+    'createdAt',
+    'updatedAt',
+  ]);
+
+  const isValidAck = (auth: AuthToken, data: AckPayload, ackId: string): boolean => {
+    const keys = Object.keys(data);
+    if (keys.length !== ACK_KEYS.size || !keys.every((k) => ACK_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      isValidId(data.ackId) &&
+      data.ackId === ackId &&
+      isValidId(data.ownerId) &&
+      data.ownerId === auth.uid &&
+      isValidId(data.feedId) &&
+      data.alertKey.length >= 1 &&
+      data.alertKey.length <= 160 &&
+      ['organic', 'test'].includes(data.eventType) &&
+      typeof data.acknowledged === 'boolean' &&
+      data.acknowledgedAtIso.length <= 64 &&
+      ((data.acknowledged === true && data.acknowledgedAtIso.length >= 1) ||
+        (data.acknowledged === false && data.acknowledgedAtIso.length === 0)) &&
+      typeof data.createdAt === 'number' &&
+      typeof data.updatedAt === 'number'
+    );
+  };
+
+  const evaluateAckCreate = (
+    auth: AuthToken | null,
+    ackId: string,
+    incoming: AckPayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(ackId)) return false;
+    if (!isValidAck(auth, incoming, ackId)) return false;
+    return incoming.createdAt === REQ_TIME && incoming.updatedAt === REQ_TIME;
+  };
+
+  const evaluateAckUpdate = (
+    auth: AuthToken | null,
+    ackId: string,
+    existing: AckPayload,
+    incoming: AckPayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(ackId)) return false;
+    if (!isValidAck(auth, incoming, ackId)) return false;
+    const affected = Object.keys(incoming).filter((k) => incoming[k] !== existing[k]);
+    const allowed = new Set(['acknowledged', 'acknowledgedAtIso', 'updatedAt']);
+    return (
+      existing.ownerId === auth.uid &&
+      incoming.ackId === existing.ackId &&
+      incoming.ownerId === existing.ownerId &&
+      incoming.feedId === existing.feedId &&
+      incoming.alertKey === existing.alertKey &&
+      incoming.eventType === existing.eventType &&
+      incoming.createdAt === existing.createdAt &&
+      incoming.updatedAt === REQ_TIME &&
+      affected.every((k) => allowed.has(k))
+    );
+  };
+
+  const validAckId = 'ack_uid_alice_default_feed_2026-11-18_10';
+  const baseAck: AckPayload = {
+    ackId: validAckId,
+    ownerId: 'uid_alice',
+    feedId: 'default_feed',
+    alertKey: '2026-11-18:10',
+    eventType: 'organic',
+    acknowledged: true,
+    acknowledgedAtIso: '2026-11-21T19:00:00.000Z',
+    createdAt: REQ_TIME,
+    updatedAt: REQ_TIME,
+  };
+
+  assert.equal(evaluateAckCreate(aliceAuth, validAckId, baseAck), true);
+  // Cross-user ownerId spoof denied
+  assert.equal(
+    evaluateAckCreate(aliceAuth, validAckId, { ...baseAck, ownerId: 'uid_bob' }),
+    false
+  );
+  // Contradictory acknowledged=true with empty timestamp denied
+  assert.equal(
+    evaluateAckCreate(aliceAuth, validAckId, { ...baseAck, acknowledgedAtIso: '' }),
+    false
+  );
+  // Shadow field injection denied
+  assert.equal(
+    evaluateAckCreate(aliceAuth, validAckId, { ...baseAck, isAdmin: true }),
+    false
+  );
+  // Valid toggle back to Pending (acknowledged=false, acknowledgedAtIso='') succeeds
+  const existingAck = { ...baseAck, createdAt: REQ_TIME - 5000, updatedAt: REQ_TIME - 5000 };
+  const revertedPending = {
+    ...existingAck,
+    acknowledged: false,
+    acknowledgedAtIso: '',
+    updatedAt: REQ_TIME,
+  };
+  assert.equal(evaluateAckUpdate(aliceAuth, validAckId, existingAck, revertedPending), true);
+  // Mutating immutable alertKey on update is denied
+  assert.equal(
+    evaluateAckUpdate(aliceAuth, validAckId, existingAck, {
+      ...revertedPending,
+      alertKey: 'tampered',
+    }),
+    false
+  );
+});
+
+
 

@@ -440,6 +440,76 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "FeedAlertAcknowledgment": {
+      "title": "FeedAlertAcknowledgment",
+      "description": "User-scoped subscriber growth alert acknowledgment state persisted in Firestore for real-time synchronization across Feed Performance Alert History sessions.",
+      "type": "object",
+      "properties": {
+        "ackId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic document identifier (<ack_uid_feedId_alertKey>) matching the Firestore document ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the authenticated user owning this acknowledgment state."
+        },
+        "feedId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Sanitized RSS feed identifier or default_feed."
+        },
+        "alertKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Canonical subscriber growth alert key (dateKey:threshold for organic crossings or event ID for test runs)."
+        },
+        "eventType": {
+          "type": "string",
+          "enum": ["organic", "test"],
+          "description": "Origin type of the subscriber growth alert row."
+        },
+        "acknowledged": {
+          "type": "boolean",
+          "description": "True when marked Acknowledged; false when reverted to Pending."
+        },
+        "acknowledgedAtIso": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64,
+          "description": "ISO-8601 client timestamp when acknowledged, or empty string when Pending."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set on initial acknowledgment document creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every Pending/Acknowledged toggle."
+        }
+      },
+      "required": [
+        "ackId",
+        "ownerId",
+        "feedId",
+        "alertKey",
+        "eventType",
+        "acknowledged",
+        "acknowledgedAtIso",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -466,6 +536,12 @@
         "$ref": "#/entities/PublicShareLink"
       },
       "description": "Capability-ID public share link documents with non-enumerable public get, Principal Owner / owner-scoped list auditing, and atomic Scrub & Re-Link support."
+    },
+    "/feedAlertAcknowledgments/{ackId}": {
+      "schema": {
+        "$ref": "#/entities/FeedAlertAcknowledgment"
+      },
+      "description": "User-scoped subscriber growth alert acknowledgment documents synced in real time with the Feed Performance Alert History drawer."
     }
   }
 }

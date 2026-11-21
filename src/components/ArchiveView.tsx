@@ -3,6 +3,8 @@ import { Headphones, Loader2, Rss, Trash2 } from 'lucide-react';
 import type { AudioBriefing, LocalRssFeedConfig, PlaybackPosition } from '../types';
 import { formatClock } from '../utils/wavUtils';
 import { ArchiveSummaryDashboard } from './ArchiveSummaryDashboard';
+import { FeedPerformanceDashboard } from './FeedPerformanceDashboard';
+import { ListenerEngagementDashboard } from './ListenerEngagementDashboard';
 import { PrivateRssFeedModal } from './PrivateRssFeedModal';
 
 interface ArchiveViewProps {
@@ -63,6 +65,22 @@ export function ArchiveView({
       {/* Weekly Listening & Processed Articles Summary Dashboard (D3 Line Chart) */}
       <ArchiveSummaryDashboard archive={archive} />
 
+      {/* Recharts Listener Engagement Dashboard (Listen Duration & Completion Rate Trends) */}
+      <ListenerEngagementDashboard
+        archive={archive}
+        playbackPositions={playbackPositions}
+        onOpenBriefing={onOpenBriefing}
+      />
+
+      {/* Recharts Feed Performance Dashboard (Active Subscribers & Total Downloads Over Time) */}
+      <FeedPerformanceDashboard
+        archive={archive}
+        rssFeedConfig={rssFeedConfig}
+        onRssFeedConfigChange={onRssFeedConfigChange}
+        onOpenBriefing={onOpenBriefing}
+        onOpenRssModal={() => setRssModalOpen(true)}
+      />
+
       {archive.length === 0 ? (
         <div className="mt-8 p-10 text-center bg-[#13161C] border border-[#22D3EE]/30 rounded-lg">
           <p className="font-serif text-xl text-[#F5F7FA]">No archived editions yet</p>
@@ -85,6 +103,7 @@ export function ArchiveView({
             const hasResumePoint = Boolean(
               savedPos && (savedPos.segmentIndex > 0 || savedPos.currentTime >= 2)
             );
+            const isCompleted = Boolean(savedPos?.completed && !hasResumePoint);
             const totalSeconds = item.segments.reduce(
               (sum, s) => sum + (s.audioDurationSeconds || s.estimatedSeconds || 60),
               0
@@ -122,6 +141,14 @@ export function ArchiveView({
                         <span aria-hidden="true">·</span>
                         <span className="font-mono text-[#22D3EE] font-medium tabular-nums">
                           Paused at Ch. {savedPos.segmentIndex + 1} ({formatClock(savedPos.currentTime)})
+                        </span>
+                      </>
+                    )}
+                    {isCompleted && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono text-[#34D399] font-medium tabular-nums">
+                          Completed (100%)
                         </span>
                       </>
                     )}

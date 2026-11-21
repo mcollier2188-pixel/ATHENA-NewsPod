@@ -1,6 +1,7 @@
 import type {
   AudioBriefing,
   LocalRssFeedConfig,
+  RssFeedAnalyticsSnapshot,
   RssFeedManifestPublic,
 } from '../types';
 import { loadBriefingAudio } from '../utils/audioCache';
@@ -77,6 +78,26 @@ export function loadLocalRssFeedConfig(): LocalRssFeedConfig | null {
         parsed.syncedSignatures && typeof parsed.syncedSignatures === 'object'
           ? parsed.syncedSignatures
           : {},
+      expiresAt: parsed.expiresAt ?? null,
+      passwordProtected: Boolean(parsed.passwordProtected),
+      accessKeyToken: parsed.accessKeyToken,
+      useSignedUrlKey: parsed.useSignedUrlKey !== false,
+      growthAlert:
+        parsed.growthAlert && typeof parsed.growthAlert === 'object'
+          ? {
+              enabled: parsed.growthAlert.enabled !== false,
+              thresholdPercent:
+                typeof parsed.growthAlert.thresholdPercent === 'number' &&
+                Number.isFinite(parsed.growthAlert.thresholdPercent)
+                  ? Math.min(200, Math.max(1, parsed.growthAlert.thresholdPercent))
+                  : 10,
+              browserNotificationsEnabled: Boolean(
+                parsed.growthAlert.browserNotificationsEnabled
+              ),
+              acknowledgedSignature:
+                parsed.growthAlert.acknowledgedSignature ?? null,
+            }
+          : undefined,
     };
   } catch {
     return null;
@@ -95,12 +116,19 @@ export function saveLocalRssFeedConfig(config: LocalRssFeedConfig | null): void 
   }
 }
 
-export function buildAbsoluteRssUrl(feedToken: string): string {
+export function buildAbsoluteRssUrl(
+  feedToken: string,
+  accessKeyToken?: string
+): string {
   const origin =
     typeof window !== 'undefined' && window.location?.origin
       ? window.location.origin
       : '';
-  return `${origin}/api/rss/${encodeURIComponent(feedToken)}.xml`;
+  const base = `${origin}/api/rss/${encodeURIComponent(feedToken)}.xml`;
+  if (accessKeyToken) {
+    return `${base}?key=${encodeURIComponent(accessKeyToken)}`;
+  }
+  return base;
 }
 
 export async function createPrivateRssFeed(
@@ -108,6 +136,9 @@ export async function createPrivateRssFeed(
     title: string;
     description?: string;
     author?: string;
+    expiresAt?: string | null;
+    passwordProtected?: boolean;
+    password?: string | null;
   },
   auth?: { token?: string | null }
 ): Promise<{ feed: RssFeedManifestPublic; manageToken: string }> {
@@ -131,9 +162,31 @@ export async function fetchPrivateRssFeed(
   return data.feed;
 }
 
+export async function fetchPrivateRssAnalytics(
+  feedId: string,
+  auth: RssAuthHeadersOptions
+): Promise<RssFeedAnalyticsSnapshot> {
+  const res = await fetch(
+    `/api/rss/feeds/${encodeURIComponent(feedId)}/analytics`,
+    {
+      method: 'GET',
+      headers: buildHeaders(auth),
+    }
+  );
+  const data = await parseApiResponse<{ analytics: RssFeedAnalyticsSnapshot }>(res);
+  return data.analytics;
+}
+
 export async function updatePrivateRssFeed(
   feedId: string,
-  payload: { title?: string; description?: string; author?: string },
+  payload: {
+    title?: string;
+    description?: string;
+    author?: string;
+    expiresAt?: string | null;
+    passwordProtected?: boolean;
+    password?: string | null;
+  },
   auth: RssAuthHeadersOptions
 ): Promise<RssFeedManifestPublic> {
   const res = await fetch(`/api/rss/feeds/${encodeURIComponent(feedId)}`, {
@@ -412,6 +465,9 @@ export async function syncArchiveToPrivateFeed(
     title: manifest.title,
     description: manifest.description,
     author: manifest.author,
+    expiresAt: manifest.expiresAt,
+    passwordProtected: manifest.passwordProtected,
+    accessKeyToken: manifest.accessKeyToken,
     lastSyncedAt: new Date().toISOString(),
     syncedSignatures: cleanSignatures,
   };

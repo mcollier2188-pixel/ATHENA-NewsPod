@@ -127,6 +127,8 @@ export interface PlaybackPosition {
   duration: number;
   playbackRate: number;
   updatedAt: string;
+  completed?: boolean;
+  maxListenedSeconds?: number;
 }
 
 export interface InspectedSourceTarget {
@@ -216,7 +218,52 @@ export interface RssFeedManifestPublic {
   author: string;
   createdAt: string;
   updatedAt: string;
+  expiresAt: string | null;
+  isExpired: boolean;
+  passwordProtected: boolean;
+  accessKeyToken?: string;
   episodes: RssFeedEpisodeSummary[];
+}
+
+export type FeedAlertEventStatus =
+  | 'Active'
+  | 'Acknowledged'
+  | 'Historical'
+  | 'Test Verified';
+
+export interface FeedAlertHistoryEntry {
+  id: string;
+  triggeredAt: string;
+  windowStartDate: string;
+  dateKey: string;
+  eventType: 'organic' | 'test';
+  feedTitle: string;
+  thresholdPercent: number;
+  growthPct: number;
+  varianceOverThresholdPct: number;
+  startSubscribers: number;
+  endSubscribers: number;
+  netNewSubscribers: number;
+  targetSubscribers?: number;
+  trailing7dDownloads: number;
+  dailyDownloads: number;
+  downloadsPerSubscriber?: number;
+  topClientFamily?: RssClientAppFamily;
+  feedAccessLabel?: string;
+  deliveryChannelSummary?: string;
+  acknowledged?: boolean;
+  acknowledgedAt?: string | null;
+  ackSyncSource?: 'firestore' | 'local';
+  driverBriefingId?: string;
+  driverEpisodeTitle: string;
+  status: FeedAlertEventStatus;
+}
+
+export interface FeedGrowthAlertConfig {
+  enabled: boolean;
+  thresholdPercent: number;
+  browserNotificationsEnabled: boolean;
+  acknowledgedSignature?: string | null;
 }
 
 export interface LocalRssFeedConfig {
@@ -229,6 +276,35 @@ export interface LocalRssFeedConfig {
   autoSync: boolean;
   lastSyncedAt: string | null;
   syncedSignatures: Record<string, string>;
+  expiresAt?: string | null;
+  passwordProtected?: boolean;
+  accessKeyToken?: string;
+  useSignedUrlKey?: boolean;
+  growthAlert?: FeedGrowthAlertConfig;
+}
+
+export type RssClientAppFamily =
+  | 'Apple Podcasts'
+  | 'Overcast'
+  | 'Pocket Casts'
+  | 'Direct & Web RSS';
+
+export interface RssDailyTelemetryBucket {
+  date: string; // YYYY-MM-DD
+  subscribers: number;
+  downloads: number;
+  rssPolls: number;
+}
+
+export interface RssFeedAnalyticsSnapshot {
+  feedId: string;
+  totalLiveDownloads: number;
+  totalLivePolls: number;
+  uniqueLiveSubscribers: number;
+  dailyBuckets: RssDailyTelemetryBucket[];
+  episodeDownloads: Record<string, number>;
+  clientBreakdown: Record<RssClientAppFamily, number>;
+  lastActivityAt: string | null;
 }
 
 export type MockupCanvasMode = 'light' | 'dark';
