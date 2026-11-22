@@ -582,6 +582,24 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidHighlightItem(h) {
+      return h is map
+        && h.keys().hasAll(['id', 'text', 'passageIndex', 'createdAt'])
+        && h.keys().hasOnly(['id', 'text', 'passageIndex', 'createdAt'])
+        && isValidId(h.id)
+        && isBoundedString(h.text, 2, 600)
+        && h.passageIndex is number
+        && h.passageIndex >= 0
+        && h.passageIndex <= 999
+        && isBoundedString(h.createdAt, 1, 64);
+    }
+
+    function isValidHighlightList(listVal) {
+      return listVal is list
+        && listVal.size() <= 20
+        && (listVal.size() == 0 || isValidHighlightItem(listVal[0]));
+    }
+
     function isValidNotebookSource(data, docId) {
       return data.keys().hasAll([
         'docId',
@@ -622,6 +640,7 @@ service cloud.firestore {
         'url',
         'summary',
         'keyFacts',
+        'highlights',
         'content',
         'estimatedReadMinutes',
         'selected',
@@ -649,6 +668,7 @@ service cloud.firestore {
       && isBoundedString(data.url, 0, 2048)
       && isBoundedString(data.summary, 0, 2000)
       && isBoundedListOfStringsWithMax(data.keyFacts, 12, 300)
+      && (!('highlights' in data) || isValidHighlightList(data.highlights))
       && isBoundedString(data.content, 0, 30000)
       && data.estimatedReadMinutes is number
       && data.estimatedReadMinutes >= 1
@@ -1366,17 +1386,18 @@ service cloud.firestore {
         && isValidId(docId)
         && isValidNotebookSource(incoming(), docId)
         && (
-          // Action 1: Owner toggling selection or Read Later state
+          // Action 1: Owner toggling selection, Read Later, or saved snippet highlights
           (
             isNotebookSourceOwnerSyncAction()
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'selected',
               'readLater',
               'shelvedAt',
+              'highlights',
               'updatedAt'
             ])
           )
-          // Action 2: Owner syncing tags, metadata, or Drive link updates
+          // Action 2: Owner syncing tags, highlights, metadata, or Drive link updates
           || (
             isNotebookSourceOwnerSyncAction()
             && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -1389,6 +1410,7 @@ service cloud.firestore {
               'url',
               'summary',
               'keyFacts',
+              'highlights',
               'content',
               'estimatedReadMinutes',
               'selected',

@@ -45,6 +45,33 @@ export interface CitationRef {
   excerpt: string;
 }
 
+export interface ArticleHighlight {
+  id: string;
+  text: string;
+  passageIndex: number;
+  createdAt: string;
+}
+
+export interface HighlightsMetaSummaryTheme {
+  heading: string;
+  synthesis: string;
+  sourceTitles: string[];
+}
+
+export interface HighlightsMetaSummary {
+  id: string;
+  createdAt: string;
+  title: string;
+  subtitle: string;
+  executiveOverview: string;
+  themes: HighlightsMetaSummaryTheme[];
+  keyTakeaways: string[];
+  citations: CitationRef[];
+  sourceCount: number;
+  highlightCount: number;
+  sourceTitles: string[];
+}
+
 export interface NewsArticle {
   id: string;
   title: string;
@@ -56,6 +83,7 @@ export interface NewsArticle {
   url?: string;
   summary: string;
   keyFacts: string[];
+  highlights?: ArticleHighlight[];
   content: string;
   passages?: SourcePassage[];
   estimatedReadMinutes: number;

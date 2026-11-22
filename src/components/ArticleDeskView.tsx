@@ -1,4 +1,11 @@
-import { useMemo, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import {
   AlertCircle,
   ArrowUpLeft,
@@ -6,21 +13,27 @@ import {
   BookOpen,
   Box,
   Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
   ExternalLink,
   FileText,
   HardDrive,
   Headphones,
+  Highlighter,
   Link2,
   Loader2,
   Minus,
   RefreshCw,
   RotateCcw,
+  Search,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import {
   VOICE_OPTIONS,
+  type ArticleHighlight,
   type BriefingPreferences,
   type BriefingTone,
   type BroadcastFormat,
@@ -31,14 +44,27 @@ import {
   type VoiceTone,
 } from '../types';
 import { EDITION_COVER_IMAGE } from '../data/sampleArticles';
+import {
+  copyTextToClipboard,
+  formatArticleHighlightsMarkdown,
+} from '../utils/highlightMarkdown';
 
 interface ArticleDeskViewProps {
   articles: NewsArticle[];
   readLaterArticles: NewsArticle[];
+  queueTab?: 'active' | 'readLater';
+  onQueueTabChange?: (tab: 'active' | 'readLater') => void;
   preferences: BriefingPreferences;
   onPreferencesChange: (next: BriefingPreferences) => void;
   onOpenAddModal: (tab: 'upload' | 'drive' | 'url' | 'text') => void;
   onInspectSource: (sourceId: string) => void;
+  onInspectHighlight?: (
+    sourceId: string,
+    passageIndex: number,
+    excerpt: string
+  ) => void;
+  onAddHighlight?: (articleId: string, phrase: string) => void;
+  onRemoveHighlight?: (articleId: string, highlightId?: string) => void;
   onToggleArticle: (id: string) => void;
   onToggleAll: (selected: boolean) => void;
   onBulkToggleCategory: (category: string, selected: boolean) => void;
@@ -51,6 +77,10 @@ interface ArticleDeskViewProps {
   refreshArticlesStatus: string | null;
   refreshArticlesError: string | null;
   onDismissRefreshError: () => void;
+  onGenerateHighlightsSummary?: (scope?: 'selected' | 'all') => Promise<void> | void;
+  isGeneratingHighlightsSummary?: boolean;
+  hasSavedHighlightsSummary?: boolean;
+  onOpenSavedHighlightsSummary?: () => void;
   onBuildBriefing: (autoSynthesize: boolean) => Promise<void>;
   isGenerating: boolean;
   generationStatus: string | null;
@@ -102,13 +132,496 @@ function formatSourceType(type?: SourceType): string {
   }
 }
 
+function formatShelvedDate(iso?: string): string | null {
+  if (!iso) return null;
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+  }).format(parsed);
+}
+
+interface ArticleSnippetData {
+  previewText: string;
+  expandedParagraphs: string[];
+  totalWords: number;
+  isExpandable: boolean;
+  hasMoreInGuide: boolean;
+}
+
+function buildArticleSnippetData(article: NewsArticle): ArticleSnippetData | null {
+  const rawBody =
+    (article.content || '').trim() ||
+    (article.passages || [])
+      .map((p) => p.text)
+      .join('\n\n')
+      .trim();
+
+  if (!rawBody) return null;
+
+  const normalizedSummary = (article.summary || '').replace(/\s+/g, ' ').trim();
+  let workingBody = rawBody.replace(/\r\n/g, '\n').trim();
+
+  if (normalizedSummary.length >= 24) {
+    const flatBody = workingBody.replace(/\s+/g, ' ').trim();
+    if (flatBody.toLowerCase() === normalizedSummary.toLowerCase()) {
+      return null;
+    }
+    if (flatBody.toLowerCase().startsWith(normalizedSummary.toLowerCase())) {
+      workingBody = flatBody
+        .slice(normalizedSummary.length)
+        .replace(/^[\s.:;,-]+/, '')
+        .trim();
+    }
+  }
+
+  if (workingBody.length < 30) {
+    return null;
+  }
+
+  const totalWords = rawBody.split(/\s+/).filter(Boolean).length;
+  const paragraphs = workingBody
+    .split(/\n{2,}/)
+    .map((p) => p.replace(/\s+/g, ' ').trim())
+    .filter((p) => p.length > 0);
+
+  if (paragraphs.length === 0) return null;
+
+  const previewText = paragraphs.join(' ');
+  const CLAMP_CHAR_THRESHOLD = 210;
+  const MAX_EXPANDED_CHARS = 880;
+  const isExpandable =
+    previewText.length > CLAMP_CHAR_THRESHOLD || paragraphs.length > 1;
+
+  const expandedParagraphs: string[] = [];
+  let usedChars = 0;
+  let truncated = false;
+
+  for (const para of paragraphs) {
+    if (
+      usedChars + para.length <= MAX_EXPANDED_CHARS ||
+      expandedParagraphs.length === 0
+    ) {
+      if (para.length > MAX_EXPANDED_CHARS && expandedParagraphs.length === 0) {
+        const slice = para.slice(0, MAX_EXPANDED_CHARS);
+        const lastSentenceEnd = Math.max(
+          slice.lastIndexOf('. '),
+          slice.lastIndexOf('! '),
+          slice.lastIndexOf('? ')
+        );
+        const cut =
+          lastSentenceEnd > 240
+            ? slice.slice(0, lastSentenceEnd + 1).trim()
+            : `${slice.replace(/\s+\S*$/, '').trim()}…`;
+        expandedParagraphs.push(cut);
+        usedChars += cut.length;
+        truncated = true;
+        break;
+      }
+      expandedParagraphs.push(para);
+      usedChars += para.length;
+    } else {
+      const remaining = MAX_EXPANDED_CHARS - usedChars;
+      if (remaining >= 140) {
+        const slice = para.slice(0, remaining);
+        const lastSentenceEnd = Math.max(
+          slice.lastIndexOf('. '),
+          slice.lastIndexOf('! '),
+          slice.lastIndexOf('? ')
+        );
+        const cut =
+          lastSentenceEnd > 90
+            ? slice.slice(0, lastSentenceEnd + 1).trim()
+            : `${slice.replace(/\s+\S*$/, '').trim()}…`;
+        expandedParagraphs.push(cut);
+      }
+      truncated = true;
+      break;
+    }
+  }
+
+  const hasMoreInGuide = truncated || usedChars < workingBody.length - 20;
+
+  return {
+    previewText,
+    expandedParagraphs,
+    totalWords,
+    isExpandable,
+    hasMoreInGuide,
+  };
+}
+
+function escapeSnippetRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function renderHighlightedSnippetText(
+  text: string,
+  highlights?: ArticleHighlight[]
+): ReactNode {
+  const validPhrases = Array.from(
+    new Set(
+      (highlights || [])
+        .map((h) => h.text.replace(/\s+/g, ' ').trim())
+        .filter((p) => p.length >= 2)
+    )
+  ).sort((a, b) => b.length - a.length);
+
+  if (validPhrases.length === 0 || !text) return text;
+
+  const pattern = new RegExp(
+    `(${validPhrases
+      .map((p) => escapeSnippetRegExp(p).replace(/\s+/g, '\\s+'))
+      .join('|')})`,
+    'gi'
+  );
+  const parts = text.split(pattern);
+  if (parts.length <= 1) return text;
+
+  return parts.map((part, idx) =>
+    idx % 2 === 1 ? (
+      <mark
+        key={idx}
+        className="bg-[#22D3EE]/20 text-[#ECFEFF] border-b border-[#22D3EE]/70 rounded-xs px-0.5"
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
+}
+
+function ArticleSnippetPreview({
+  article,
+  isExpanded,
+  onToggleExpand,
+  onInspectSource,
+  onInspectHighlight,
+  onAddHighlight,
+  onRemoveHighlight,
+}: {
+  article: NewsArticle;
+  isExpanded: boolean;
+  onToggleExpand: () => void;
+  onInspectSource: () => void;
+  onInspectHighlight?: (passageIndex: number, excerpt: string) => void;
+  onAddHighlight?: (phrase: string) => void;
+  onRemoveHighlight?: (highlightId?: string) => void;
+}) {
+  const snippet = useMemo(() => buildArticleSnippetData(article), [article]);
+  const snippetBodyRef = useRef<HTMLDivElement | null>(null);
+  const copyResetTimerRef = useRef<number | null>(null);
+  const [pendingSelection, setPendingSelection] = useState<string | null>(null);
+  const [copiedMarkdown, setCopiedMarkdown] = useState(false);
+
+  const highlights = article.highlights || [];
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleCopyHighlightsMarkdown = async () => {
+    const markdown = formatArticleHighlightsMarkdown(article);
+    if (!markdown) return;
+    const ok = await copyTextToClipboard(markdown);
+    if (ok) {
+      setCopiedMarkdown(true);
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+      copyResetTimerRef.current = window.setTimeout(() => {
+        setCopiedMarkdown(false);
+        copyResetTimerRef.current = null;
+      }, 2200);
+    }
+  };
+
+  const captureSnippetSelection = useCallback(() => {
+    if (!onAddHighlight || typeof window === 'undefined') return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) {
+      setPendingSelection(null);
+      return;
+    }
+    const container = snippetBodyRef.current;
+    if (!container) return;
+
+    const anchorInside = sel.anchorNode ? container.contains(sel.anchorNode) : false;
+    const focusInside = sel.focusNode ? container.contains(sel.focusNode) : false;
+    if (!anchorInside || !focusInside) {
+      setPendingSelection(null);
+      return;
+    }
+
+    const normalized = sel.toString().replace(/\s+/g, ' ').trim();
+    if (normalized.length >= 2) {
+      setPendingSelection(normalized.slice(0, 600));
+    } else {
+      setPendingSelection(null);
+    }
+  }, [onAddHighlight]);
+
+  const handleConfirmHighlight = () => {
+    if (!pendingSelection || !onAddHighlight) return;
+    onAddHighlight(pendingSelection);
+    setPendingSelection(null);
+    if (typeof window !== 'undefined') {
+      window.getSelection()?.removeAllRanges();
+    }
+  };
+
+  const handleDismissSelection = () => {
+    setPendingSelection(null);
+    if (typeof window !== 'undefined') {
+      window.getSelection()?.removeAllRanges();
+    }
+  };
+
+  if (!snippet && highlights.length === 0) return null;
+
+  const isAlreadyHighlighted = pendingSelection
+    ? highlights.some(
+        (h) => h.text.toLowerCase() === pendingSelection.toLowerCase()
+      )
+    : false;
+  const atHighlightCap = highlights.length >= 20 && !isAlreadyHighlighted;
+
+  return (
+    <div className="mt-2.5 pt-2.5 border-t border-[#1C222D] max-w-2xl">
+      {snippet && (
+        <>
+          <div className="flex items-center justify-between gap-3 mb-1.5">
+            <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-[#6E788A] tabular-nums">
+              <span>Content Snippet</span>
+              <span aria-hidden="true">·</span>
+              <span>{snippet.totalWords} words</span>
+              {onAddHighlight && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-[#8C96A8]">
+                    {highlights.length > 0
+                      ? `${highlights.length} highlighted`
+                      : 'Select phrase to highlight'}
+                  </span>
+                </>
+              )}
+            </div>
+
+            {snippet.isExpandable && (
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingSelection(null);
+                  onToggleExpand();
+                }}
+                aria-expanded={isExpanded}
+                aria-label={
+                  isExpanded
+                    ? `Show less of snippet for ${article.title}`
+                    : `Show more of snippet for ${article.title}`
+                }
+                className="inline-flex items-center gap-1 text-xs font-medium text-[#67E8F9] hover:text-[#22D3EE] transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <span>{isExpanded ? 'Show less' : 'Show more'}</span>
+                {isExpanded ? (
+                  <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+              </button>
+            )}
+          </div>
+
+          <div
+            ref={snippetBodyRef}
+            onMouseUp={captureSnippetSelection}
+            onKeyUp={captureSnippetSelection}
+            onTouchEnd={captureSnippetSelection}
+            className="select-text selection:bg-[#22D3EE]/30 selection:text-[#F5F7FA]"
+          >
+            {!isExpanded ? (
+              <p className="text-[13px] text-[#8C96A8] leading-relaxed line-clamp-3">
+                {renderHighlightedSnippetText(snippet.previewText, highlights)}
+              </p>
+            ) : (
+              <div className="space-y-2 text-[13px] text-[#C7D0DF] leading-relaxed">
+                {snippet.expandedParagraphs.map((para, idx) => (
+                  <p key={idx}>{renderHighlightedSnippetText(para, highlights)}</p>
+                ))}
+                {snippet.hasMoreInGuide && (
+                  <p className="pt-0.5 text-xs text-[#6E788A] select-none">
+                    Continues in full text <span aria-hidden="true">·</span>{' '}
+                    <button
+                      type="button"
+                      onClick={onInspectSource}
+                      className="font-medium text-[#67E8F9] hover:text-[#22D3EE] hover:underline whitespace-nowrap cursor-pointer"
+                    >
+                      Read all passages in Source Guide
+                    </button>
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {pendingSelection && onAddHighlight && (
+            <div
+              role="region"
+              aria-label="Save selected phrase highlight"
+              className="mt-2 px-3 py-2 rounded-md bg-[#101822] border border-[#22D3EE]/55 flex flex-wrap items-center justify-between gap-2.5"
+            >
+              <p className="text-xs text-[#D5DCE6] min-w-0 flex-1 truncate">
+                <span className="font-mono text-[11px] text-[#67E8F9] mr-1.5">
+                  Selected:
+                </span>
+                “{pendingSelection}”
+              </p>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={isAlreadyHighlighted}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={handleConfirmHighlight}
+                  className="h-7 px-2.5 inline-flex items-center gap-1.5 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] disabled:opacity-50 disabled:cursor-default rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Highlighter className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>
+                    {isAlreadyHighlighted
+                      ? 'Already Highlighted'
+                      : atHighlightCap
+                        ? 'Save Highlight (replaces oldest)'
+                        : 'Save Highlight'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={handleDismissSelection}
+                  className="h-7 px-2 text-xs text-[#8C96A8] hover:text-[#F5F7FA] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {highlights.length > 0 && (
+        <div
+          className={`${
+            snippet ? 'mt-2.5 pt-2 border-t border-[#1A202B]' : ''
+          } space-y-1.5`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] tabular-nums">
+            <div className="flex items-center gap-1.5 text-[#67E8F9]">
+              <Highlighter className="w-3 h-3 text-[#22D3EE] shrink-0" aria-hidden="true" />
+              <span>Saved for Briefing</span>
+              <span aria-hidden="true" className="text-[#4B5565]">
+                ·
+              </span>
+              <span>
+                {highlights.length} {highlights.length === 1 ? 'phrase' : 'phrases'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  void handleCopyHighlightsMarkdown();
+                }}
+                aria-live="polite"
+                aria-label={`Copy ${highlights.length} highlighted ${
+                  highlights.length === 1 ? 'passage' : 'passages'
+                } and source citations to clipboard as Markdown`}
+                title="Copy highlighted passages with source citations as Markdown"
+                className={`h-6 px-2 inline-flex items-center gap-1.5 font-sans text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  copiedMarkdown
+                    ? 'bg-[#132630] text-[#67E8F9] border-[#22D3EE]/65'
+                    : 'bg-[#121720] text-[#D5DCE6] border-[#273142] hover:border-[#22D3EE]/55 hover:text-[#67E8F9]'
+                }`}
+              >
+                {copiedMarkdown ? (
+                  <>
+                    <Check className="w-3 h-3 text-[#22D3EE] shrink-0" aria-hidden="true" />
+                    <span>Copied Markdown</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3 h-3 text-[#22D3EE] shrink-0" aria-hidden="true" />
+                    <span>Copy to Clipboard</span>
+                  </>
+                )}
+              </button>
+
+              {onRemoveHighlight && highlights.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => onRemoveHighlight()}
+                  className="text-[#6E788A] hover:text-[#F87171] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
+          </div>
+
+          <ul className="space-y-1.5">
+            {highlights.map((hl) => (
+              <li
+                key={hl.id}
+                className="flex items-start justify-between gap-2.5 text-xs text-[#D5DCE6] leading-snug"
+              >
+                <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                  <span className="text-[#E4E9F1]">“{hl.text}”</span>
+                  {hl.passageIndex > 0 && onInspectHighlight && (
+                    <button
+                      type="button"
+                      onClick={() => onInspectHighlight(hl.passageIndex, hl.text)}
+                      className="font-mono text-[11px] text-[#67E8F9] hover:text-[#22D3EE] hover:underline tabular-nums whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Passage {hl.passageIndex}
+                    </button>
+                  )}
+                </div>
+                {onRemoveHighlight && (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveHighlight(hl.id)}
+                    aria-label={`Remove highlight "${hl.text.slice(0, 40)}"`}
+                    className="p-0.5 text-[#6E788A] hover:text-[#F87171] rounded transition-colors shrink-0 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ArticleDeskView({
   articles,
   readLaterArticles,
+  queueTab,
+  onQueueTabChange,
   preferences,
   onPreferencesChange,
   onOpenAddModal,
   onInspectSource,
+  onInspectHighlight,
+  onAddHighlight,
+  onRemoveHighlight,
   onToggleArticle,
   onToggleAll,
   onBulkToggleCategory,
@@ -121,6 +634,10 @@ export function ArticleDeskView({
   refreshArticlesStatus,
   refreshArticlesError,
   onDismissRefreshError,
+  onGenerateHighlightsSummary,
+  isGeneratingHighlightsSummary = false,
+  hasSavedHighlightsSummary = false,
+  onOpenSavedHighlightsSummary,
   onBuildBriefing,
   isGenerating,
   generationStatus,
@@ -128,15 +645,62 @@ export function ArticleDeskView({
   onProjectArticleTo3D,
 }: ArticleDeskViewProps) {
   const [failedImages, setFailedImages] = useState<Record<string, boolean>>({});
-  const [deskTab, setDeskTab] = useState<'active' | 'readLater'>('active');
+  const [internalDeskTab, setInternalDeskTab] = useState<'active' | 'readLater'>(
+    'active'
+  );
+  const [searchQuery, setSearchQuery] = useState('');
+  const [readLaterCategoryFilter, setReadLaterCategoryFilter] = useState<string | null>(
+    null
+  );
+  const [expandedSnippets, setExpandedSnippets] = useState<Record<string, boolean>>(
+    {}
+  );
+
+  const deskTab: 'active' | 'readLater' = queueTab ?? internalDeskTab;
+
+  const setDeskTab = (next: 'active' | 'readLater') => {
+    setInternalDeskTab(next);
+    onQueueTabChange?.(next);
+  };
+
+  const toggleSnippet = (articleId: string) => {
+    setExpandedSnippets((prev) => ({
+      ...prev,
+      [articleId]: !prev[articleId],
+    }));
+  };
 
   const selectedArticles = articles.filter((a) => a.selected);
+  const selectedHighlightCount = selectedArticles.reduce(
+    (sum, a) => sum + (a.highlights?.length || 0),
+    0
+  );
+  const selectedHighlightedSourceCount = selectedArticles.filter(
+    (a) => (a.highlights?.length || 0) > 0
+  ).length;
+  const allDeskArticles = useMemo(
+    () => [...articles, ...readLaterArticles],
+    [articles, readLaterArticles]
+  );
+  const totalHighlightCount = useMemo(
+    () =>
+      allDeskArticles.reduce((sum, a) => sum + (a.highlights?.length || 0), 0),
+    [allDeskArticles]
+  );
+  const totalHighlightedSourceCount = useMemo(
+    () => allDeskArticles.filter((a) => (a.highlights?.length || 0) > 0).length,
+    [allDeskArticles]
+  );
   const totalReadMinutes = selectedArticles.reduce(
     (sum, a) => sum + (a.estimatedReadMinutes || 3),
     0
   );
+  const readLaterReadMinutes = readLaterArticles.reduce(
+    (sum, a) => sum + (a.estimatedReadMinutes || 3),
+    0
+  );
   const totalSourcesCount = articles.length + readLaterArticles.length;
-  const urlSourcesCount = [...articles, ...readLaterArticles].filter((a) => {
+  const urlSourcesCount = allDeskArticles.filter((a) => {
     if (a.driveFileId) return false;
     const rawUrl = a.url?.trim();
     return Boolean(rawUrl && /^https?:\/\//i.test(rawUrl));
@@ -167,6 +731,56 @@ export function ArticleDeskView({
       return a.label.localeCompare(b.label);
     });
   }, [articles]);
+
+  const readLaterCategoryGroups = useMemo(() => {
+    const groups = new Map<string, { label: string; count: number }>();
+    for (const article of readLaterArticles) {
+      const label = (article.category || '').trim() || 'General';
+      const key = label.toLowerCase();
+      const existing = groups.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        groups.set(key, { label, count: 1 });
+      }
+    }
+    return Array.from(groups.values()).sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    });
+  }, [readLaterArticles]);
+
+  const effectiveReadLaterCategory =
+    readLaterCategoryFilter &&
+    readLaterCategoryGroups.some(
+      (g) => g.label.toLowerCase() === readLaterCategoryFilter.toLowerCase()
+    )
+      ? readLaterCategoryFilter
+      : null;
+
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+
+  const filteredActiveArticles = useMemo(() => {
+    if (!normalizedQuery) return articles;
+    return articles.filter((a) => {
+      const highlightHay = (a.highlights || []).map((h) => h.text).join(' ');
+      const hay = `${a.title} ${a.source} ${a.category} ${a.summary} ${(a.tags || []).join(' ')} ${highlightHay}`.toLowerCase();
+      return hay.includes(normalizedQuery);
+    });
+  }, [articles, normalizedQuery]);
+
+  const filteredReadLaterArticles = useMemo(() => {
+    return readLaterArticles.filter((a) => {
+      if (effectiveReadLaterCategory) {
+        const label = ((a.category || '').trim() || 'General').toLowerCase();
+        if (label !== effectiveReadLaterCategory.toLowerCase()) return false;
+      }
+      if (!normalizedQuery) return true;
+      const highlightHay = (a.highlights || []).map((h) => h.text).join(' ');
+      const hay = `${a.title} ${a.source} ${a.category} ${a.summary} ${(a.tags || []).join(' ')} ${highlightHay}`.toLowerCase();
+      return hay.includes(normalizedQuery);
+    });
+  }, [readLaterArticles, effectiveReadLaterCategory, normalizedQuery]);
 
   const todayFormatted = new Intl.DateTimeFormat('en-US', {
     weekday: 'long',
@@ -262,39 +876,55 @@ export function ArticleDeskView({
 
           {/* Active Sources & Read Later Workspace Overview */}
           <section aria-label="Queued sources">
-            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#22D3EE]/35">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3.5 border-b border-[#22D3EE]/35">
               <div className="flex flex-wrap items-center gap-4">
                 <div
                   role="tablist"
-                  aria-label="Desk source queue"
-                  className="inline-flex items-center gap-1 p-1 bg-[#13161C] border border-[#222833] rounded-md"
+                  aria-label="Toggle between Active Sources and Read Later queues"
+                  onKeyDown={(e) => {
+                    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                      e.preventDefault();
+                      setDeskTab(deskTab === 'active' ? 'readLater' : 'active');
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 p-1 bg-[#13161C] border border-[#273040] rounded-md"
                 >
                   <button
+                    id="studio-desk-tab-active"
                     type="button"
                     role="tab"
                     aria-selected={deskTab === 'active'}
+                    aria-controls="studio-desk-panel-active"
                     onClick={() => setDeskTab('active')}
-                    className={`px-3 py-1 text-xs font-medium rounded transition-colors tabular-nums whitespace-nowrap cursor-pointer ${
+                    className={`h-8 px-3.5 inline-flex items-center gap-2 text-xs font-semibold rounded transition-colors tabular-nums whitespace-nowrap shrink-0 cursor-pointer ${
                       deskTab === 'active'
-                        ? 'bg-[#182430] text-[#67E8F9] border border-[#22D3EE]/45'
+                        ? 'bg-[#182430] text-[#67E8F9] border border-[#22D3EE]/55'
                         : 'text-[#8C96A8] hover:text-[#F5F7FA] border border-transparent'
                     }`}
                   >
-                    Active Sources ({articles.length})
+                    <span>Active Sources</span>
+                    <span className="font-mono text-[11px] opacity-90">
+                      ({articles.length})
+                    </span>
                   </button>
                   <button
+                    id="studio-desk-tab-read-later"
                     type="button"
                     role="tab"
                     aria-selected={deskTab === 'readLater'}
+                    aria-controls="studio-desk-panel-read-later"
                     onClick={() => setDeskTab('readLater')}
-                    className={`px-3 py-1 inline-flex items-center gap-1.5 text-xs font-medium rounded transition-colors tabular-nums whitespace-nowrap cursor-pointer ${
+                    className={`h-8 px-3.5 inline-flex items-center gap-1.5 text-xs font-semibold rounded transition-colors tabular-nums whitespace-nowrap shrink-0 cursor-pointer ${
                       deskTab === 'readLater'
-                        ? 'bg-[#182430] text-[#67E8F9] border border-[#22D3EE]/45'
+                        ? 'bg-[#182430] text-[#67E8F9] border border-[#22D3EE]/55'
                         : 'text-[#8C96A8] hover:text-[#F5F7FA] border border-transparent'
                     }`}
                   >
-                    <Bookmark className="w-3 h-3" aria-hidden="true" />
-                    Read Later ({readLaterArticles.length})
+                    <Bookmark className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>Read Later</span>
+                    <span className="font-mono text-[11px] opacity-90">
+                      ({readLaterArticles.length})
+                    </span>
                   </button>
                 </div>
 
@@ -303,13 +933,54 @@ export function ArticleDeskView({
                     {selectedArticles.length} selected · {totalReadMinutes} min source read
                   </span>
                 ) : (
-                  <span className="text-xs font-mono text-[#8C96A8]">
-                    Shelved out of active briefings
+                  <span className="text-xs font-mono text-[#8C96A8] tabular-nums">
+                    {readLaterArticles.length}{' '}
+                    {readLaterArticles.length === 1 ? 'article' : 'articles'} shelved ·{' '}
+                    {readLaterReadMinutes} min saved read
                   </span>
                 )}
               </div>
 
               <div className="flex flex-wrap items-center gap-3 text-xs font-medium">
+                {onGenerateHighlightsSummary && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void onGenerateHighlightsSummary();
+                    }}
+                    disabled={totalHighlightCount === 0 || isGeneratingHighlightsSummary}
+                    title={
+                      totalHighlightCount > 0
+                        ? `Synthesize a meta-briefing summary from ${totalHighlightCount} ${
+                            totalHighlightCount === 1 ? 'highlight' : 'highlights'
+                          } across ${totalHighlightedSourceCount} ${
+                            totalHighlightedSourceCount === 1 ? 'source' : 'sources'
+                          }`
+                        : 'Select phrases inside any article snippet first to generate a meta-briefing summary'
+                    }
+                    className="h-8 px-3 inline-flex items-center gap-1.5 text-xs font-medium text-[#67E8F9] bg-[#131F2B] hover:bg-[#182938] border border-[#22D3EE]/50 hover:border-[#67E8F9] disabled:opacity-45 disabled:pointer-events-none rounded-md transition-colors tabular-nums whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {isGeneratingHighlightsSummary ? (
+                      <Loader2
+                        className="w-3.5 h-3.5 text-[#22D3EE] animate-spin shrink-0"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <Highlighter
+                        className="w-3.5 h-3.5 text-[#22D3EE] shrink-0"
+                        aria-hidden="true"
+                      />
+                    )}
+                    <span>
+                      {isGeneratingHighlightsSummary
+                        ? 'Synthesizing Highlights...'
+                        : totalHighlightCount > 0
+                          ? `Generate Summary from Highlights (${totalHighlightCount})`
+                          : 'Generate Summary from Highlights'}
+                    </span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => {
@@ -373,12 +1044,49 @@ export function ArticleDeskView({
                       className="inline-flex items-center gap-1.5 text-[#67E8F9] hover:text-[#22D3EE] whitespace-nowrap shrink-0 cursor-pointer"
                     >
                       <ArrowUpLeft className="w-3.5 h-3.5" aria-hidden="true" />
-                      Move all to Notebook
+                      Move all to Active Sources
                     </button>
                   )
                 )}
               </div>
             </div>
+
+            {totalSourcesCount > 0 && (
+              <div className="py-3 border-b border-[#1E2430] flex items-center gap-2.5">
+                <div className="relative flex-1">
+                  <Search
+                    className="w-3.5 h-3.5 text-[#6E788A] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                    aria-hidden="true"
+                  />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder={
+                      deskTab === 'active'
+                        ? 'Filter Active Sources by title, topic, or publication...'
+                        : 'Filter Read Later articles by title, topic, or publication...'
+                    }
+                    aria-label={
+                      deskTab === 'active'
+                        ? 'Filter Active Sources'
+                        : 'Filter Read Later articles'
+                    }
+                    className="w-full h-9 pl-9 pr-8 text-xs text-[#F5F7FA] placeholder:text-[#6E788A] bg-[#0E1116] border border-[#222833] focus:border-[#22D3EE]/60 rounded-md outline-none transition-colors"
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      aria-label="Clear filter query"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#6E788A] hover:text-[#F5F7FA] cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
 
             {isRefreshingArticles && refreshArticlesStatus && (
               <div
@@ -414,7 +1122,12 @@ export function ArticleDeskView({
             )}
 
             {deskTab === 'active' ? (
-              articles.length === 0 ? (
+              <div
+                id="studio-desk-panel-active"
+                role="tabpanel"
+                aria-labelledby="studio-desk-tab-active"
+              >
+                {articles.length === 0 ? (
                 <div className="py-14 text-center border-b border-[#222833]">
                   <p className="font-serif text-lg text-[#F5F7FA]">
                     Active workspace is clear
@@ -546,11 +1259,29 @@ export function ArticleDeskView({
                     </div>
                   )}
 
-                  <ul className="divide-y divide-[#1E2430]">
-                    {articles.map((article, index) => {
-                      const hasWorkingImg =
-                        Boolean(article.imageUrl) && !failedImages[article.id];
-                      const passageCount = article.passages?.length || 0;
+                  {filteredActiveArticles.length === 0 ? (
+                    <div className="py-10 text-center border-b border-[#222833]">
+                      <p className="text-sm text-[#A0AABB]">
+                        No Active Sources match{' '}
+                        <span className="font-mono text-[#67E8F9]">
+                          "{searchQuery.trim()}"
+                        </span>
+                        .
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setSearchQuery('')}
+                        className="mt-2.5 text-xs font-medium text-[#22D3EE] hover:underline cursor-pointer"
+                      >
+                        Clear search filter
+                      </button>
+                    </div>
+                  ) : (
+                    <ul className="divide-y divide-[#1E2430]">
+                      {filteredActiveArticles.map((article, index) => {
+                        const hasWorkingImg =
+                          Boolean(article.imageUrl) && !failedImages[article.id];
+                        const passageCount = article.passages?.length || 0;
 
                     return (
                       <li
@@ -593,6 +1324,14 @@ export function ArticleDeskView({
                                 {article.estimatedReadMinutes} min
                                 {passageCount > 0 ? ` · ${passageCount} passages` : ''}
                               </span>
+                              {(article.highlights?.length ?? 0) > 0 && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="font-mono tabular-nums text-[#67E8F9]">
+                                    {article.highlights!.length} highlighted
+                                  </span>
+                                </>
+                              )}
                             </div>
 
                             <button
@@ -606,6 +1345,30 @@ export function ArticleDeskView({
                             <p className="mt-2 text-sm text-[#A0AABB] leading-relaxed max-w-2xl">
                               {article.summary}
                             </p>
+
+                            <ArticleSnippetPreview
+                              article={article}
+                              isExpanded={Boolean(expandedSnippets[article.id])}
+                              onToggleExpand={() => toggleSnippet(article.id)}
+                              onInspectSource={() => onInspectSource(article.id)}
+                              onInspectHighlight={
+                                onInspectHighlight
+                                  ? (passageIndex, excerpt) =>
+                                      onInspectHighlight(article.id, passageIndex, excerpt)
+                                  : undefined
+                              }
+                              onAddHighlight={
+                                onAddHighlight
+                                  ? (phrase) => onAddHighlight(article.id, phrase)
+                                  : undefined
+                              }
+                              onRemoveHighlight={
+                                onRemoveHighlight
+                                  ? (highlightId) =>
+                                      onRemoveHighlight(article.id, highlightId)
+                                  : undefined
+                              }
+                            />
 
                             <div className="mt-3 flex flex-wrap items-center gap-4 text-xs">
                               <button
@@ -696,103 +1459,289 @@ export function ArticleDeskView({
                       </li>
                     );
                   })}
-                  </ul>
+                    </ul>
+                  )}
                 </>
-              )
-            ) : readLaterArticles.length === 0 ? (
-              <div className="py-14 text-center border-b border-[#222833]">
-                <Bookmark className="w-6 h-6 mx-auto text-[#394457]" aria-hidden="true" />
-                <p className="mt-3 font-serif text-lg text-[#F5F7FA]">
-                  Your Read Later queue is empty
-                </p>
-                <p className="mt-1.5 text-sm text-[#A0AABB] max-w-md mx-auto">
-                  Click <span className="text-[#67E8F9]">Read Later</span> on any article in your Notebook or sidebar to set it aside without deleting it before building a briefing.
-                </p>
+                )}
               </div>
             ) : (
-              <ul className="divide-y divide-[#1E2430]">
-                {readLaterArticles.map((article, index) => {
-                  const passageCount = article.passages?.length || 0;
-                  return (
-                    <li key={article.id} className="py-5">
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex flex-wrap items-center gap-2 text-xs text-[#8C96A8]">
-                            <span className="font-mono tabular-nums text-[#6E788A]">
-                              {String(index + 1).padStart(2, '0')}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-medium text-[#22D3EE]">
-                              {formatSourceType(article.sourceType)}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span>{article.category}</span>
-                            <span aria-hidden="true">·</span>
-                            <span className="truncate max-w-[180px]">{article.source}</span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-mono tabular-nums">
-                              {article.estimatedReadMinutes} min
-                              {passageCount > 0 ? ` · ${passageCount} passages` : ''}
-                            </span>
-                          </div>
-
-                          <button
-                            type="button"
-                            onClick={() => onInspectSource(article.id)}
-                            className="mt-1.5 text-left font-serif text-lg font-medium text-[#F5F7FA] hover:text-[#67E8F9] transition-colors leading-snug cursor-pointer"
-                          >
-                            {article.title}
-                          </button>
-
-                          <p className="mt-2 text-sm text-[#A0AABB] leading-relaxed max-w-2xl">
-                            {article.summary}
-                          </p>
-
-                          <div className="mt-3 flex flex-wrap items-center gap-4 text-xs">
-                            <button
-                              type="button"
-                              onClick={() => onToggleReadLater(article.id)}
-                              className="inline-flex items-center gap-1.5 font-medium text-[#22D3EE] hover:text-[#67E8F9] transition-colors cursor-pointer"
-                            >
-                              <ArrowUpLeft className="w-3.5 h-3.5" aria-hidden="true" />
-                              Move back to Notebook
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() => onInspectSource(article.id)}
-                              className="inline-flex items-center gap-1.5 text-[#A0AABB] hover:text-[#F5F7FA] transition-colors cursor-pointer"
-                            >
-                              <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
-                              Open Source Guide
-                            </button>
-
-                            {onProjectArticleTo3D && (
-                              <button
-                                type="button"
-                                onClick={() => onProjectArticleTo3D(article)}
-                                className="inline-flex items-center gap-1.5 text-[#A0AABB] hover:text-[#67E8F9] transition-colors cursor-pointer whitespace-nowrap"
-                              >
-                                <Box className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
-                                3D Foil Card
-                              </button>
-                            )}
-
-                            <button
-                              type="button"
-                              onClick={() => onRemoveArticle(article.id)}
-                              className="inline-flex items-center gap-1 text-[#6E788A] hover:text-[#F87171] transition-colors cursor-pointer ml-auto"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
-                              Delete
-                            </button>
-                          </div>
-                        </div>
+              <div
+                id="studio-desk-panel-read-later"
+                role="tabpanel"
+                aria-labelledby="studio-desk-tab-read-later"
+              >
+                {readLaterArticles.length === 0 ? (
+                  <div className="py-14 text-center border-b border-[#222833]">
+                    <Bookmark className="w-6 h-6 mx-auto text-[#394457]" aria-hidden="true" />
+                    <p className="mt-3 font-serif text-lg text-[#F5F7FA]">
+                      Your Read Later queue is empty
+                    </p>
+                    <p className="mt-1.5 text-sm text-[#A0AABB] max-w-md mx-auto">
+                      Click <span className="text-[#67E8F9]">Read Later</span> on any article in Active Sources or the sidebar to shelve it out of audio briefings for later reading.
+                    </p>
+                    {articles.length > 0 && (
+                      <div className="mt-5 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setDeskTab('active')}
+                          className="px-4 py-2 text-xs font-semibold text-[#071318] bg-[#22D3EE] hover:bg-[#67E8F9] rounded-md transition-colors tabular-nums whitespace-nowrap cursor-pointer"
+                        >
+                          Browse Active Sources ({articles.length})
+                        </button>
                       </div>
-                    </li>
-                  );
-                })}
-              </ul>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {readLaterCategoryGroups.length > 1 && (
+                      <div
+                        role="region"
+                        aria-label="Filter Read Later articles by category"
+                        className="py-3 border-b border-[#1E2430] flex flex-wrap items-center gap-2"
+                      >
+                        <span className="text-xs font-semibold text-[#F5F7FA] mr-1">
+                          Category
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setReadLaterCategoryFilter(null)}
+                          aria-pressed={effectiveReadLaterCategory === null}
+                          className={`h-7 px-2.5 font-mono text-[11px] rounded border transition-colors tabular-nums whitespace-nowrap shrink-0 cursor-pointer ${
+                            effectiveReadLaterCategory === null
+                              ? 'bg-[#16222E] text-[#67E8F9] border-[#22D3EE]/60'
+                              : 'bg-[#11151C] text-[#8C96A8] border-[#222833] hover:border-[#22D3EE]/40 hover:text-[#F5F7FA]'
+                          }`}
+                        >
+                          All ({readLaterArticles.length})
+                        </button>
+                        {readLaterCategoryGroups.map((group) => {
+                          const isSelected =
+                            effectiveReadLaterCategory?.toLowerCase() ===
+                            group.label.toLowerCase();
+                          return (
+                            <button
+                              key={group.label.toLowerCase()}
+                              type="button"
+                              onClick={() =>
+                                setReadLaterCategoryFilter(
+                                  isSelected ? null : group.label
+                                )
+                              }
+                              aria-pressed={isSelected}
+                              className={`h-7 px-2.5 font-mono text-[11px] rounded border transition-colors tabular-nums whitespace-nowrap shrink-0 cursor-pointer ${
+                                isSelected
+                                  ? 'bg-[#16222E] text-[#67E8F9] border-[#22D3EE]/60'
+                                  : 'bg-[#11151C] text-[#8C96A8] border-[#222833] hover:border-[#22D3EE]/40 hover:text-[#F5F7FA]'
+                              }`}
+                            >
+                              {group.label} · {group.count}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {filteredReadLaterArticles.length === 0 ? (
+                      <div className="py-10 text-center border-b border-[#222833]">
+                        <p className="text-sm text-[#A0AABB]">
+                          No Read Later articles match your current filter.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSearchQuery('');
+                            setReadLaterCategoryFilter(null);
+                          }}
+                          className="mt-2.5 text-xs font-medium text-[#22D3EE] hover:underline cursor-pointer"
+                        >
+                          Reset Read Later filters
+                        </button>
+                      </div>
+                    ) : (
+                      <ul className="divide-y divide-[#1E2430]">
+                        {filteredReadLaterArticles.map((article, index) => {
+                          const passageCount = article.passages?.length || 0;
+                          const shelvedLabel = formatShelvedDate(article.shelvedAt);
+                          const hasWorkingImg =
+                            Boolean(article.imageUrl) && !failedImages[article.id];
+
+                          return (
+                            <li key={article.id} className="py-5">
+                              <div className="flex items-start justify-between gap-4">
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-[#8C96A8]">
+                                    <span className="font-mono tabular-nums text-[#6E788A]">
+                                      {String(index + 1).padStart(2, '0')}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="font-medium text-[#22D3EE]">
+                                      {formatSourceType(article.sourceType)}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span>{article.category}</span>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="truncate max-w-[180px]">
+                                      {article.source}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="font-mono tabular-nums">
+                                      {article.estimatedReadMinutes} min
+                                      {passageCount > 0
+                                        ? ` · ${passageCount} passages`
+                                        : ''}
+                                    </span>
+                                    {(article.highlights?.length ?? 0) > 0 && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono tabular-nums text-[#67E8F9]">
+                                          {article.highlights!.length} highlighted
+                                        </span>
+                                      </>
+                                    )}
+                                    {shelvedLabel && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono tabular-nums text-[#67E8F9]/80">
+                                          Shelved {shelvedLabel}
+                                        </span>
+                                      </>
+                                    )}
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => onInspectSource(article.id)}
+                                    className="mt-1.5 text-left font-serif text-lg font-medium text-[#F5F7FA] hover:text-[#67E8F9] transition-colors leading-snug cursor-pointer"
+                                  >
+                                    {article.title}
+                                  </button>
+
+                                  <p className="mt-2 text-sm text-[#A0AABB] leading-relaxed max-w-2xl">
+                                    {article.summary}
+                                  </p>
+
+                                  <ArticleSnippetPreview
+                                    article={article}
+                                    isExpanded={Boolean(expandedSnippets[article.id])}
+                                    onToggleExpand={() => toggleSnippet(article.id)}
+                                    onInspectSource={() => onInspectSource(article.id)}
+                                    onInspectHighlight={
+                                      onInspectHighlight
+                                        ? (passageIndex, excerpt) =>
+                                            onInspectHighlight(
+                                              article.id,
+                                              passageIndex,
+                                              excerpt
+                                            )
+                                        : undefined
+                                    }
+                                    onAddHighlight={
+                                      onAddHighlight
+                                        ? (phrase) => onAddHighlight(article.id, phrase)
+                                        : undefined
+                                    }
+                                    onRemoveHighlight={
+                                      onRemoveHighlight
+                                        ? (highlightId) =>
+                                            onRemoveHighlight(article.id, highlightId)
+                                        : undefined
+                                    }
+                                  />
+
+                                  <div className="mt-3 flex flex-wrap items-center gap-4 text-xs">
+                                    <button
+                                      type="button"
+                                      onClick={() => onToggleReadLater(article.id)}
+                                      className="inline-flex items-center gap-1.5 font-medium text-[#22D3EE] hover:text-[#67E8F9] transition-colors whitespace-nowrap cursor-pointer"
+                                    >
+                                      <ArrowUpLeft className="w-3.5 h-3.5" aria-hidden="true" />
+                                      Move to Active Sources
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => onInspectSource(article.id)}
+                                      className="inline-flex items-center gap-1.5 text-[#A0AABB] hover:text-[#F5F7FA] transition-colors whitespace-nowrap cursor-pointer"
+                                    >
+                                      <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
+                                      Open Source Guide
+                                    </button>
+
+                                    {onProjectArticleTo3D && (
+                                      <button
+                                        type="button"
+                                        onClick={() => onProjectArticleTo3D(article)}
+                                        className="inline-flex items-center gap-1.5 text-[#A0AABB] hover:text-[#67E8F9] transition-colors cursor-pointer whitespace-nowrap"
+                                      >
+                                        <Box className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+                                        3D Foil Card
+                                      </button>
+                                    )}
+
+                                    {article.driveWebViewLink ? (
+                                      <a
+                                        href={article.driveWebViewLink}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#67E8F9] transition-colors whitespace-nowrap"
+                                      >
+                                        Open in Drive
+                                        <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                                      </a>
+                                    ) : article.url ? (
+                                      <a
+                                        href={article.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="inline-flex items-center gap-1 text-[#8C96A8] hover:text-[#F5F7FA] transition-colors whitespace-nowrap"
+                                      >
+                                        Source link
+                                        <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                                      </a>
+                                    ) : null}
+
+                                    <button
+                                      type="button"
+                                      onClick={() => onRemoveArticle(article.id)}
+                                      className="inline-flex items-center gap-1 text-[#6E788A] hover:text-[#F87171] transition-colors cursor-pointer ml-auto"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                                      Delete
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {article.imageUrl && (
+                                  <div className="hidden sm:block w-24 aspect-[4/3] rounded overflow-hidden border border-[#222833] bg-[#0E1116] shrink-0">
+                                    {hasWorkingImg ? (
+                                      <img
+                                        src={article.imageUrl}
+                                        alt={article.title}
+                                        referrerPolicy="no-referrer"
+                                        onError={() =>
+                                          setFailedImages((prev) => ({
+                                            ...prev,
+                                            [article.id]: true,
+                                          }))
+                                        }
+                                        className="w-full h-full object-cover opacity-90"
+                                      />
+                                    ) : (
+                                      <div className="w-full h-full flex items-center justify-center font-serif text-lg text-[#6E788A]">
+                                        {article.category.slice(0, 1)}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </>
+                )}
+              </div>
             )}
           </section>
         </div>
@@ -1227,6 +2176,92 @@ export function ArticleDeskView({
 
           {/* Primary Action & Progress */}
           <div className="pt-2 space-y-2.5">
+            {totalHighlightCount > 0 && (
+              <div className="pb-2 mb-1 border-b border-[#222833] space-y-2">
+                <div className="flex items-start gap-2 text-xs text-[#C7D0DF] leading-snug">
+                  <Highlighter
+                    className="w-3.5 h-3.5 text-[#22D3EE] shrink-0 mt-0.5"
+                    aria-hidden="true"
+                  />
+                  <span className="tabular-nums">
+                    {selectedHighlightCount > 0 ? (
+                      <>
+                        <span className="font-mono font-medium text-[#67E8F9]">
+                          {selectedHighlightCount}
+                        </span>{' '}
+                        highlighted{' '}
+                        {selectedHighlightCount === 1 ? 'phrase' : 'phrases'} across{' '}
+                        <span className="font-mono text-[#F5F7FA]">
+                          {selectedHighlightedSourceCount}
+                        </span>{' '}
+                        selected{' '}
+                        {selectedHighlightedSourceCount === 1 ? 'source' : 'sources'}{' '}
+                        will be prioritized and cited in your briefing.
+                      </>
+                    ) : (
+                      <>
+                        <span className="font-mono font-medium text-[#67E8F9]">
+                          {totalHighlightCount}
+                        </span>{' '}
+                        highlighted{' '}
+                        {totalHighlightCount === 1 ? 'phrase' : 'phrases'} saved across{' '}
+                        <span className="font-mono text-[#F5F7FA]">
+                          {totalHighlightedSourceCount}
+                        </span>{' '}
+                        queued{' '}
+                        {totalHighlightedSourceCount === 1 ? 'source' : 'sources'}.
+                      </>
+                    )}
+                  </span>
+                </div>
+
+                {onGenerateHighlightsSummary && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isGeneratingHighlightsSummary}
+                      onClick={() => {
+                        void onGenerateHighlightsSummary(
+                          selectedHighlightCount > 0 ? 'selected' : 'all'
+                        );
+                      }}
+                      className="flex-1 h-9 px-3 inline-flex items-center justify-center gap-1.5 text-xs font-semibold text-[#67E8F9] bg-[#131F2B] hover:bg-[#182938] border border-[#22D3EE]/55 hover:border-[#67E8F9] disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      {isGeneratingHighlightsSummary ? (
+                        <>
+                          <Loader2
+                            className="w-3.5 h-3.5 animate-spin text-[#22D3EE]"
+                            aria-hidden="true"
+                          />
+                          <span>Synthesizing Meta-Briefing...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Highlighter
+                            className="w-3.5 h-3.5 text-[#22D3EE]"
+                            aria-hidden="true"
+                          />
+                          <span>Generate Summary from Highlights</span>
+                        </>
+                      )}
+                    </button>
+
+                    {hasSavedHighlightsSummary &&
+                      onOpenSavedHighlightsSummary &&
+                      !isGeneratingHighlightsSummary && (
+                        <button
+                          type="button"
+                          onClick={onOpenSavedHighlightsSummary}
+                          className="h-9 px-3 text-xs font-medium text-[#A0AABB] hover:text-[#67E8F9] border border-[#252D3B] hover:border-[#22D3EE]/45 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          View Last Summary
+                        </button>
+                      )}
+                  </div>
+                )}
+              </div>
+            )}
+
             <button
               type="button"
               disabled={isGenerating || selectedArticles.length === 0}

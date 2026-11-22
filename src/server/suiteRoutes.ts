@@ -132,11 +132,29 @@ export interface ShareGovernanceController {
 }
 
 const ALLOWED_CHAT_MODELS = new Set([
-  'gemini-4-carbon',
-  'gemini-4-neon',
-  'gemini-4-hydrogen',
+  'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
+  'gemini-4-hydrogen',
+  'gemini-4-neon',
+  'gemini-4-carbon',
 ]);
+
+function buildChatFallbackModels(primaryModel: string): string[] {
+  const ordered = [primaryModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+  return Array.from(new Set(ordered));
+}
+
+function shouldFallbackSuiteModel(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('404') ||
+    msg.includes('NOT_FOUND') ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE')
+  );
+}
 
 const ALLOWED_IMAGE_ASPECTS = new Set(['1:1', '16:9', '4:3', '9:16', '3:4']);
 const ALLOWED_IMAGE_SIZES = new Set(['1K', '2K', '4K']);
@@ -300,11 +318,11 @@ export function registerSuiteRoutes(
   formatApiError: (err: unknown) => { status: number; message: string },
   shareGovernance: ShareGovernanceController
 ) {
-  // 1. Multi-model Gemini Chatbot (gemini-4-carbon, gemini-4-neon, gemini-4-hydrogen, gemini-3.1-flash-lite)
+  // 1. Multi-model Gemini Chatbot (default gemini-3.5-flash-lite with automatic fallback to gemini-3.1-flash-lite)
   app.post('/api/suite/chat', async (req: Request, res: Response) => {
     try {
       const {
-        model = 'gemini-4-hydrogen',
+        model = 'gemini-3.5-flash-lite',
         systemInstruction,
         messages,
       } = req.body as {
@@ -315,7 +333,7 @@ export function registerSuiteRoutes(
 
       const selectedModel = ALLOWED_CHAT_MODELS.has(model)
         ? model
-        : 'gemini-4-hydrogen';
+        : 'gemini-3.5-flash-lite';
 
       if (!Array.isArray(messages) || messages.length === 0) {
         res.status(400).json({ error: 'Provide at least one message to chat.' });
@@ -334,27 +352,52 @@ export function registerSuiteRoutes(
         parts: [{ text: String(m.text || '') }],
       }));
 
-      const chat = ai.chats.create({
-        model: selectedModel,
-        history,
-        config: {
-          systemInstruction:
-            systemInstruction?.trim() ||
-            'You are a knowledgeable, crisp Dispatch studio assistant. Give clear, structured, actionable answers.',
-        },
-      });
+      const candidateModels = buildChatFallbackModels(selectedModel);
+      let reply = '';
+      let usedModel = selectedModel;
+      let lastErr: unknown;
 
-      const response = await chat.sendMessage({
-        message: latest.text.trim(),
-      });
+      for (let i = 0; i < candidateModels.length; i++) {
+        const candidateModel = candidateModels[i];
+        try {
+          const chat = ai.chats.create({
+            model: candidateModel,
+            history,
+            config: {
+              systemInstruction:
+                systemInstruction?.trim() ||
+                'You are a knowledgeable, crisp Dispatch studio assistant. Give clear, structured, actionable answers.',
+            },
+          });
 
-      const reply = (response.text ?? '').trim();
+          const response = await chat.sendMessage({
+            message: latest.text.trim(),
+          });
+
+          reply = (response.text ?? '').trim();
+          usedModel = candidateModel;
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (i < candidateModels.length - 1 && shouldFallbackSuiteModel(err)) {
+            await new Promise((r) => setTimeout(r, 350));
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      if (lastErr) {
+        throw lastErr;
+      }
+
       if (!reply) {
         res.status(502).json({ error: 'Model returned an empty response.' });
         return;
       }
 
-      res.json({ reply, model: selectedModel });
+      res.json({ reply, model: usedModel });
     } catch (err) {
       const { status, message } = formatApiError(err);
       res.status(status).json({ error: message });
@@ -919,7 +962,7 @@ export function registerSuiteRoutes(
       const {
         threadId = 'default',
         role,
-        modelId = 'gemini-4-hydrogen',
+        modelId = 'gemini-3.5-flash-lite',
         persona = 'Managing Editor',
         content,
       } = req.body as {

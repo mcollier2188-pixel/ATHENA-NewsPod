@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import mammoth from 'mammoth';
+import { extractText } from 'unpdf';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   registerSuiteRoutes,
@@ -42,6 +43,16 @@ const isProd =
   process.env.npm_lifecycle_event === 'start' ||
   (!IS_DEV_SCRIPT && process.env.NODE_ENV !== 'development' && HAS_BUILT_CLIENT);
 
+const TEXT_MODEL_FALLBACK_CHAIN = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+] as const;
+
+const TTS_MODEL_FALLBACK_CHAIN = [
+  'gemini-3.8-flash-tts',
+  'gemini-3.8-flash-lite-tts',
+] as const;
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -59,6 +70,30 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+function isTransientGeminiError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('503') ||
+    msg.includes('500') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('DEADLINE_EXCEEDED')
+  );
+}
+
+function shouldFallbackModel(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('404') ||
+    msg.includes('NOT_FOUND') ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE')
+  );
+}
+
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -66,19 +101,43 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
       return await fn();
     } catch (err: unknown) {
       lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const isTransient =
-        msg.includes('503') ||
-        msg.includes('500') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('DEADLINE_EXCEEDED');
-      if (!isTransient || attempt === maxRetries) {
+      if (!isTransientGeminiError(err) || attempt === maxRetries) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
+      await new Promise((r) => setTimeout(r, 600 * Math.pow(2, attempt)));
     }
   }
   throw lastError;
+}
+
+async function withModelFallback<T>(
+  models: readonly string[],
+  fn: (model: string) => Promise<T>,
+  retriesPerModel = 1
+): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    try {
+      return await withRetry(() => fn(model), retriesPerModel);
+    } catch (err: unknown) {
+      lastError = err;
+      if (i < models.length - 1 && shouldFallbackModel(err)) {
+        await new Promise((r) => setTimeout(r, 300));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
+function withTextModelFallback<T>(fn: (model: string) => Promise<T>): Promise<T> {
+  return withModelFallback(TEXT_MODEL_FALLBACK_CHAIN, fn, 1);
+}
+
+function withTtsModelFallback<T>(fn: (model: string) => Promise<T>): Promise<T> {
+  return withModelFallback(TTS_MODEL_FALLBACK_CHAIN, fn, 1);
 }
 
 function formatApiError(err: unknown): { status: number; message: string } {
@@ -188,6 +247,13 @@ function buildPassages(sourceId: string, content: string, maxPassages = 32): Sou
   }));
 }
 
+interface IncomingHighlight {
+  id?: string;
+  text: string;
+  passageIndex?: number;
+  createdAt?: string;
+}
+
 interface IncomingArticle {
   id: string;
   title: string;
@@ -197,6 +263,7 @@ interface IncomingArticle {
   url?: string;
   summary: string;
   keyFacts: string[];
+  highlights?: IncomingHighlight[];
   content: string;
   passages?: SourcePassage[];
   estimatedReadMinutes: number;
@@ -230,10 +297,31 @@ function buildIndexedSourcesPrompt(articles: IncomingArticle[]): string {
         .map((p) => `[S${sNum}-P${p.index}] ${p.text}`)
         .join('\n');
 
+      const validHighlights = (Array.isArray(a.highlights) ? a.highlights : [])
+        .map((h) => {
+          const text = String(h?.text || '').trim().slice(0, 600);
+          if (text.length < 2) return null;
+          let pIdx = Number(h?.passageIndex) || 0;
+          if (pIdx < 1 || pIdx > passages.length) {
+            const matched = passages.find((p) =>
+              p.text.toLowerCase().includes(text.toLowerCase())
+            );
+            pIdx = matched ? matched.index : 1;
+          }
+          return `- [S${sNum}-P${pIdx}] "${text}"`;
+        })
+        .filter((line): line is string => Boolean(line))
+        .slice(0, 20);
+
+      const highlightsBlock =
+        validHighlights.length > 0
+          ? `\nUSER-HIGHLIGHTED PASSAGES (Prioritize & cite in briefing):\n${validHighlights.join('\n')}`
+          : '';
+
       return `SOURCE ${sNum}:
 Title: ${a.title}
 Origin: ${a.source} (${a.sourceType || 'article'} · ${a.category})
-Summary: ${a.summary}
+Summary: ${a.summary}${highlightsBlock}
 Passages:
 ${passageLines}`;
     })
@@ -578,8 +666,8 @@ app.get('/healthz', (_req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// 1A. Upload & ingest a user document (PDF, DOCX, TXT, Markdown)
-app.post('/api/sources/upload', async (req, res) => {
+// 1A. Upload & ingest a user document (PDF, DOCX, TXT, Markdown) — local text extraction first, never fails on Gemini rate limits
+app.post(['/api/sources/upload', '/api/ingest-document'], async (req, res) => {
   try {
     const { fileName, mimeType, base64Data, textContent, fileSizeBytes } = req.body as {
       fileName?: string;
@@ -615,98 +703,145 @@ app.post('/api/sources/upload', async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
+    const cleanBase64 =
+      typeof base64Data === 'string' && base64Data.includes(',')
+        ? base64Data.split(',').pop() || ''
+        : base64Data || '';
+
     const tempId = `doc-${Date.now()}`;
     const sizeLabel = formatFileSize(fileSizeBytes);
+    const sourceType: 'pdf' | 'docx' | 'markdown' | 'txt' = isPdf
+      ? 'pdf'
+      : isDocx
+        ? 'docx'
+        : isMd
+          ? 'markdown'
+          : 'txt';
 
-    // Case 1: Native multimodal PDF ingestion via gemini-4-hydrogen
+    let extractedText = '';
+
+    // Step 1: Extract text locally on the server (unpdf for PDF, mammoth for DOCX, Buffer for TXT/MD)
     if (isPdf) {
-      if (!base64Data) {
+      if (!cleanBase64) {
         res.status(400).json({ error: 'PDF file data is missing.' });
         return;
       }
 
-      const pdfResponse = await withRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'application/pdf',
-                    data: base64Data,
-                  },
-                },
-                {
-                  text: `Analyze this uploaded PDF document ("${cleanName}") and build a Notebook-style Source Guide plus a faithful, well-structured full-text digest broken into clear paragraphs separated by blank lines so individual passages can be cited accurately.`,
-                },
-              ],
-            },
-          ],
-          config: {
-            systemInstruction:
-              'You are a meticulous research librarian. Extract the document title (or clean the filename), a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "Finance", "AI", "Climate", "Health", "Science"), a crisp 2-sentence Source Guide overview, 3 to 5 concrete key facts/findings, estimated reading time in minutes, and thorough factual document text organized into clean multi-sentence paragraphs separated by double newlines (\\n\\n).',
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                category: { type: Type.STRING },
-                tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                summary: { type: Type.STRING },
-                keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
-                content: { type: Type.STRING },
-                estimatedReadMinutes: { type: Type.INTEGER },
-              },
-              required: ['title', 'category', 'tags', 'summary', 'keyFacts', 'content'],
-            },
-          },
-        })
-      );
-
-      const parsed = JSON.parse((pdfResponse.text ?? '{}').trim());
-      const content = String(parsed.content || '').trim();
-      if (!content) {
-        res.status(422).json({
-          error: 'Could not extract readable text from that PDF. Please try another document.',
-        });
+      let pdfBuffer: Buffer;
+      try {
+        pdfBuffer = Buffer.from(cleanBase64, 'base64');
+      } catch {
+        res.status(400).json({ error: 'Invalid PDF file encoding.' });
         return;
       }
 
-      const wordCount = content.split(/\s+/).filter(Boolean).length;
-      const passages = buildPassages(tempId, content);
-      const category = String(parsed.category || 'Document');
+      try {
+        const pdfResult = await extractText(new Uint8Array(pdfBuffer), { mergePages: false });
+        const rawPages = Array.isArray(pdfResult.text)
+          ? pdfResult.text
+          : [String(pdfResult.text || '')];
+        extractedText = rawPages
+          .map((page) =>
+            String(page || '')
+              .replace(/\r\n/g, '\n')
+              .replace(/[ \t]+/g, ' ')
+              .replace(/\n{3,}/g, '\n\n')
+              .trim()
+          )
+          .filter(Boolean)
+          .join('\n\n');
+      } catch {
+        extractedText = '';
+      }
 
-      res.json({
-        article: {
-          title: String(parsed.title || cleanName.replace(/\.pdf$/i, '')),
-          source: cleanName,
-          sourceType: 'pdf',
-          fileSizeLabel: sizeLabel,
-          category,
-          tags: normalizeTags(parsed.tags, category),
-          summary: String(parsed.summary || content.slice(0, 220)),
-          keyFacts: Array.isArray(parsed.keyFacts) ? parsed.keyFacts.map(String).slice(0, 5) : [],
-          content: content.slice(0, 28000),
-          passages,
-          estimatedReadMinutes:
-            Number(parsed.estimatedReadMinutes) || Math.max(1, Math.round(wordCount / 220)),
-        },
-      });
-      return;
-    }
+      // Only fall back to Gemini vision if extracted PDF text is empty (scanned PDF)
+      if (!extractedText) {
+        try {
+          const ai = getGeminiClient();
+          const pdfResponse = await withTextModelFallback((model) =>
+            ai.models.generateContent({
+              model,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      inlineData: {
+                        mimeType: 'application/pdf',
+                        data: cleanBase64,
+                      },
+                    },
+                    {
+                      text: `Analyze this scanned PDF document ("${cleanName}") and build a Notebook-style Source Guide plus a faithful, well-structured full-text digest broken into clear paragraphs separated by blank lines so individual passages can be cited accurately.`,
+                    },
+                  ],
+                },
+              ],
+              config: {
+                systemInstruction:
+                  'You are a meticulous research librarian. Extract the document title (or clean the filename), a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "Finance", "AI", "Climate", "Health", "Science"), a crisp 2-sentence Source Guide overview, 3 to 5 concrete key facts/findings, estimated reading time in minutes, and thorough factual document text organized into clean multi-sentence paragraphs separated by double newlines (\\n\\n).',
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    summary: { type: Type.STRING },
+                    keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    content: { type: Type.STRING },
+                    estimatedReadMinutes: { type: Type.INTEGER },
+                  },
+                  required: ['title', 'category', 'tags', 'summary', 'keyFacts', 'content'],
+                },
+              },
+            })
+          );
 
-    // Case 2: DOCX (mammoth) or TXT / Markdown
-    let extractedText = '';
-    if (isDocx) {
-      if (!base64Data) {
+          const parsedPdf = JSON.parse((pdfResponse.text ?? '{}').trim()) as Record<
+            string,
+            unknown
+          >;
+          const visionContent = String(parsedPdf.content || '').trim();
+          if (visionContent) {
+            const wordCount = visionContent.split(/\s+/).filter(Boolean).length;
+            const passages = buildPassages(tempId, visionContent);
+            const category = String(parsedPdf.category || 'Document');
+
+            res.json({
+              article: {
+                title: String(parsedPdf.title || cleanName.replace(/\.pdf$/i, '')),
+                source: cleanName,
+                sourceType: 'pdf',
+                fileSizeLabel: sizeLabel,
+                category,
+                tags: normalizeTags(parsedPdf.tags, category),
+                summary: String(parsedPdf.summary || visionContent.slice(0, 220)),
+                keyFacts: Array.isArray(parsedPdf.keyFacts)
+                  ? parsedPdf.keyFacts.map(String).slice(0, 5)
+                  : [],
+                content: visionContent.slice(0, 28000),
+                passages,
+                estimatedReadMinutes:
+                  Number(parsedPdf.estimatedReadMinutes) ||
+                  Math.max(1, Math.round(wordCount / 220)),
+              },
+            });
+            return;
+          }
+        } catch {
+          // If Gemini vision is rate-limited on a scanned PDF, continue with local document fallback below
+        }
+
+        extractedText = `Uploaded PDF document: ${cleanName}. This PDF contains scanned or image-based pages queued in your notebook sources.`;
+      }
+    } else if (isDocx) {
+      if (!cleanBase64) {
         res.status(400).json({ error: 'Word document data is missing.' });
         return;
       }
       try {
-        const buffer = Buffer.from(base64Data, 'base64');
+        const buffer = Buffer.from(cleanBase64, 'base64');
         const result = await mammoth.extractRawText({ buffer });
         extractedText = (result.value || '').trim();
       } catch {
@@ -718,62 +853,114 @@ app.post('/api/sources/upload', async (req, res) => {
     } else {
       extractedText = (
         textContent ||
-        (base64Data ? Buffer.from(base64Data, 'base64').toString('utf-8') : '')
+        (cleanBase64 ? Buffer.from(cleanBase64, 'base64').toString('utf-8') : '')
       ).trim();
     }
 
-    if (extractedText.length < 30) {
+    if (!extractedText) {
       res.status(422).json({
-        error: 'The uploaded document appears to be empty or has too little readable text.',
+        error: 'The uploaded document appears to be empty.',
       });
       return;
     }
 
+    // Step 2: Build immediate local fallback metadata & passages so uploads never fail on API limits
     const clippedText = extractedText.slice(0, 28000);
-    const guideRes = await withRetry(() =>
-      ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Create a Notebook-style Source Guide for the uploaded document "${cleanName}":\n\n${clippedText.slice(0, 22000)}`,
-        config: {
-          systemInstruction:
-            'You are a fast research editor. Extract a clean document title, a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "AI", "Climate", "Finance", "Science"), a crisp 2-sentence Source Guide overview, 3 to 5 key facts/takeaways with specific details, and estimated reading minutes.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              category: { type: Type.STRING },
-              tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-              summary: { type: Type.STRING },
-              keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              estimatedReadMinutes: { type: Type.INTEGER },
-            },
-            required: ['title', 'category', 'tags', 'summary', 'keyFacts'],
-          },
-        },
-      })
-    );
-
-    const parsed = JSON.parse((guideRes.text ?? '{}').trim());
     const wordCount = clippedText.split(/\s+/).filter(Boolean).length;
+    const computedReadMinutes = Math.max(1, Math.round(wordCount / 220));
     const passages = buildPassages(tempId, clippedText);
-    const sourceType = isDocx ? 'docx' : isMd ? 'markdown' : 'txt';
-    const category = String(parsed.category || 'Document');
+
+    const mdHeadingMatch = isMd ? clippedText.match(/^#\s+([^\r\n]{2,140})/) : null;
+    const cleanedBaseTitle =
+      (mdHeadingMatch ? mdHeadingMatch[1].trim() : '') ||
+      cleanName
+        .replace(/\.(pdf|docx|txt|md|markdown)$/i, '')
+        .replace(/[_-]+/g, ' ')
+        .trim() ||
+      'Uploaded Document';
+
+    const firstParagraph = (
+      passages[0]?.text ||
+      clippedText.split(/\n{2,}/)[0] ||
+      clippedText
+    )
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 260);
+
+    const fallbackKeyFacts = passages
+      .slice(0, 4)
+      .map((p) => p.text.replace(/\s+/g, ' ').trim().slice(0, 220))
+      .filter(Boolean);
+
+    let resolvedTitle = cleanedBaseTitle;
+    let resolvedCategory = 'Document';
+    let resolvedTags = normalizeTags([], resolvedCategory);
+    let resolvedSummary = firstParagraph;
+    let resolvedKeyFacts = fallbackKeyFacts;
+    let resolvedReadMinutes = computedReadMinutes;
+
+    // Step 3: Optional Gemini Source Guide enrichment — wrapped in try/catch so 429/errors never fail uploads
+    try {
+      const ai = getGeminiClient();
+      const guideRes = await withTextModelFallback((model) =>
+        ai.models.generateContent({
+          model,
+          contents: `Create a Notebook-style Source Guide for the uploaded document "${cleanName}":\n\n${clippedText.slice(0, 22000)}`,
+          config: {
+            systemInstruction:
+              'You are a fast research editor. Extract a clean document title, a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "AI", "Climate", "Finance", "Science"), a crisp 2-sentence Source Guide overview, 3 to 5 key facts/takeaways with specific details, and estimated reading minutes.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                category: { type: Type.STRING },
+                tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                summary: { type: Type.STRING },
+                keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                estimatedReadMinutes: { type: Type.INTEGER },
+              },
+              required: ['title', 'category', 'tags', 'summary', 'keyFacts'],
+            },
+          },
+        })
+      );
+
+      const parsed = JSON.parse((guideRes.text ?? '{}').trim()) as Record<string, unknown>;
+      if (typeof parsed.title === 'string' && parsed.title.trim()) {
+        resolvedTitle = parsed.title.trim();
+      }
+      if (typeof parsed.category === 'string' && parsed.category.trim()) {
+        resolvedCategory = parsed.category.trim();
+      }
+      resolvedTags = normalizeTags(parsed.tags, resolvedCategory);
+      if (typeof parsed.summary === 'string' && parsed.summary.trim()) {
+        resolvedSummary = parsed.summary.trim();
+      }
+      if (Array.isArray(parsed.keyFacts) && parsed.keyFacts.length > 0) {
+        resolvedKeyFacts = parsed.keyFacts.map(String).filter(Boolean).slice(0, 5);
+      }
+      if (Number(parsed.estimatedReadMinutes) > 0) {
+        resolvedReadMinutes = Number(parsed.estimatedReadMinutes);
+      }
+    } catch {
+      // Keep local fallback title, first-paragraph summary, and extracted passages
+    }
 
     res.json({
       article: {
-        title: String(parsed.title || cleanName.replace(/\.(docx|txt|md|markdown)$/i, '')),
+        title: resolvedTitle,
         source: cleanName,
         sourceType,
         fileSizeLabel: sizeLabel,
-        category,
-        tags: normalizeTags(parsed.tags, category),
-        summary: String(parsed.summary || clippedText.slice(0, 220)),
-        keyFacts: Array.isArray(parsed.keyFacts) ? parsed.keyFacts.map(String).slice(0, 5) : [],
+        category: resolvedCategory,
+        tags: resolvedTags,
+        summary: resolvedSummary,
+        keyFacts: resolvedKeyFacts,
         content: clippedText,
         passages,
-        estimatedReadMinutes:
-          Number(parsed.estimatedReadMinutes) || Math.max(1, Math.round(wordCount / 220)),
+        estimatedReadMinutes: resolvedReadMinutes,
       },
     });
   } catch (err) {
@@ -794,7 +981,6 @@ app.post('/api/articles/ingest', async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
     const tempId = `art-${Date.now()}`;
 
     // Case A: URL provided — use Gemini urlContext with graceful fallback to server fetch
@@ -822,9 +1008,10 @@ app.post('/api/articles/ingest', async (req, res) => {
       } | null = null;
 
       try {
-        const urlResponse = await withRetry(() =>
+        const ai = getGeminiClient();
+        const urlResponse = await withTextModelFallback((model) =>
           ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
+            model,
             contents: `Read the news article at ${parsedUrl.toString()} and extract its core editorial content. Return ONLY a raw JSON object (no markdown commentary) with these exact keys:
 {
   "title": "Exact or cleaned headline",
@@ -865,6 +1052,7 @@ app.post('/api/articles/ingest', async (req, res) => {
 
       if (!extracted) {
         let pageText = '';
+        let scrapedTitle = '';
         try {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 9000);
@@ -881,6 +1069,8 @@ app.post('/api/articles/ingest', async (req, res) => {
             throw new Error(`Site returned HTTP ${pageRes.status}`);
           }
           const html = await pageRes.text();
+          const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+          scrapedTitle = titleMatch ? stripHtmlToText(titleMatch[1]).slice(0, 180) : '';
           pageText = stripHtmlToText(html).slice(0, 18000);
         } catch {
           res.status(422).json({
@@ -898,42 +1088,69 @@ app.post('/api/articles/ingest', async (req, res) => {
           return;
         }
 
-        const fastRes = await withRetry(() =>
-          ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents: `Extract structured editorial metadata, 2 to 3 concise topic tags (like Tech, Economy, Politics, Energy, Science), and clean article reporting from this scraped webpage from ${parsedUrl.hostname}:\n\n${pageText}`,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  source: { type: Type.STRING },
-                  category: { type: Type.STRING },
-                  tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  summary: { type: Type.STRING },
-                  keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  content: { type: Type.STRING },
-                  estimatedReadMinutes: { type: Type.INTEGER },
+        try {
+          const ai = getGeminiClient();
+          const fastRes = await withTextModelFallback((model) =>
+            ai.models.generateContent({
+              model,
+              contents: `Extract structured editorial metadata, 2 to 3 concise topic tags (like Tech, Economy, Politics, Energy, Science), and clean article reporting from this scraped webpage from ${parsedUrl.hostname}:\n\n${pageText}`,
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    source: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    summary: { type: Type.STRING },
+                    keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    content: { type: Type.STRING },
+                    estimatedReadMinutes: { type: Type.INTEGER },
+                  },
+                  required: [
+                    'title',
+                    'source',
+                    'category',
+                    'tags',
+                    'summary',
+                    'keyFacts',
+                    'content',
+                  ],
                 },
-                required: ['title', 'source', 'category', 'tags', 'summary', 'keyFacts', 'content'],
               },
-            },
-          })
-        );
+            })
+          );
 
-        const parsed = JSON.parse((fastRes.text ?? '{}').trim());
-        const category = String(parsed.category || 'News');
-        extracted = {
-          title: String(parsed.title || parsedUrl.hostname),
-          source: String(parsed.source || parsedUrl.hostname.replace(/^www\./, '')),
-          category,
-          tags: normalizeTags(parsed.tags, category),
-          summary: String(parsed.summary || ''),
-          keyFacts: Array.isArray(parsed.keyFacts) ? parsed.keyFacts.map(String).slice(0, 4) : [],
-          content: String(parsed.content || pageText.slice(0, 3000)),
-          estimatedReadMinutes: Math.max(1, Number(parsed.estimatedReadMinutes) || 4),
-        };
+          const parsed = JSON.parse((fastRes.text ?? '{}').trim());
+          const category = String(parsed.category || 'News');
+          extracted = {
+            title: String(parsed.title || scrapedTitle || parsedUrl.hostname),
+            source: String(parsed.source || parsedUrl.hostname.replace(/^www\./, '')),
+            category,
+            tags: normalizeTags(parsed.tags, category),
+            summary: String(parsed.summary || pageText.slice(0, 240)),
+            keyFacts: Array.isArray(parsed.keyFacts)
+              ? parsed.keyFacts.map(String).slice(0, 4)
+              : [],
+            content: String(parsed.content || pageText.slice(0, 8000)),
+            estimatedReadMinutes: Math.max(1, Number(parsed.estimatedReadMinutes) || 4),
+          };
+        } catch {
+          const cleanSource = parsedUrl.hostname.replace(/^www\./, '');
+          const localPassages = buildPassages(tempId, pageText.slice(0, 12000));
+          const wordCount = pageText.split(/\s+/).filter(Boolean).length;
+          extracted = {
+            title: scrapedTitle || cleanSource,
+            source: cleanSource,
+            category: 'News',
+            tags: normalizeTags([], 'News'),
+            summary: (localPassages[0]?.text || pageText).slice(0, 240),
+            keyFacts: localPassages.slice(0, 3).map((p) => p.text.slice(0, 200)),
+            content: pageText.slice(0, 12000),
+            estimatedReadMinutes: Math.max(1, Math.round(wordCount / 220)),
+          };
+        }
       }
 
       const passages = buildPassages(tempId, extracted.content);
@@ -949,52 +1166,83 @@ app.post('/api/articles/ingest', async (req, res) => {
       return;
     }
 
-    // Case B: Raw pasted text — fast extraction with gemini-3.1-flash-lite
-    const fastResponse = await withRetry(() =>
-      ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Analyze this pasted source text and return structured editorial metadata:\n\n${trimmedText.slice(0, 24000)}`,
-        config: {
-          systemInstruction:
-            'You are a fast copy editor. Extract a clean headline, source/publication name (use "Personal Note" if none is mentioned), a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "AI", "Climate", "Finance", "Science"), a crisp 2-sentence editorial summary, 3 concrete key facts, and estimated reading time in minutes.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              source: { type: Type.STRING },
-              category: { type: Type.STRING },
-              tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-              summary: { type: Type.STRING },
-              keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
-              estimatedReadMinutes: { type: Type.INTEGER },
-            },
-            required: ['title', 'source', 'category', 'tags', 'summary', 'keyFacts'],
-          },
-        },
-      })
-    );
-
-    const parsed = JSON.parse((fastResponse.text ?? '{}').trim());
+    // Case B: Raw pasted text — fast extraction with gemini-3.5-flash-lite -> gemini-3.1-flash-lite + local fallback
     const content = trimmedText.slice(0, 24000);
     const wordCount = content.split(/\s+/).filter(Boolean).length;
     const computedMinutes = Math.max(1, Math.round(wordCount / 220));
     const passages = buildPassages(tempId, content);
-    const category = String(parsed.category || 'Briefing');
+    const firstParagraph = (passages[0]?.text || content.split(/\n{2,}/)[0] || content)
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    let title = firstParagraph.slice(0, 72) || 'Untitled Source';
+    let source = 'Personal Note';
+    let category = 'Briefing';
+    let tags = normalizeTags([], category);
+    let summary = firstParagraph.slice(0, 240);
+    let keyFacts = passages.slice(0, 3).map((p) => p.text.slice(0, 200));
+    let estimatedReadMinutes = computedMinutes;
+
+    try {
+      const ai = getGeminiClient();
+      const fastResponse = await withTextModelFallback((model) =>
+        ai.models.generateContent({
+          model,
+          contents: `Analyze this pasted source text and return structured editorial metadata:\n\n${content}`,
+          config: {
+            systemInstruction:
+              'You are a fast copy editor. Extract a clean headline, source/publication name (use "Personal Note" if none is mentioned), a 1-2 word topic category, 2 to 3 concise context-relevant tags (like "Tech", "Economy", "Politics", "Energy", "Policy", "AI", "Climate", "Finance", "Science"), a crisp 2-sentence editorial summary, 3 concrete key facts, and estimated reading time in minutes.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                source: { type: Type.STRING },
+                category: { type: Type.STRING },
+                tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                summary: { type: Type.STRING },
+                keyFacts: { type: Type.ARRAY, items: { type: Type.STRING } },
+                estimatedReadMinutes: { type: Type.INTEGER },
+              },
+              required: ['title', 'source', 'category', 'tags', 'summary', 'keyFacts'],
+            },
+          },
+        })
+      );
+
+      const parsed = JSON.parse((fastResponse.text ?? '{}').trim()) as Record<string, unknown>;
+      if (typeof parsed.title === 'string' && parsed.title.trim()) title = parsed.title.trim();
+      if (typeof parsed.source === 'string' && parsed.source.trim()) source = parsed.source.trim();
+      if (typeof parsed.category === 'string' && parsed.category.trim()) {
+        category = parsed.category.trim();
+      }
+      tags = normalizeTags(parsed.tags, category);
+      if (typeof parsed.summary === 'string' && parsed.summary.trim()) {
+        summary = parsed.summary.trim();
+      }
+      if (Array.isArray(parsed.keyFacts) && parsed.keyFacts.length > 0) {
+        keyFacts = parsed.keyFacts.map(String).slice(0, 4);
+      }
+      if (Number(parsed.estimatedReadMinutes) > 0) {
+        estimatedReadMinutes = Number(parsed.estimatedReadMinutes);
+      }
+    } catch {
+      // Keep local passages and first-paragraph metadata if Gemini is rate-limited
+    }
 
     res.json({
       article: {
-        title: String(parsed.title || 'Untitled Source'),
-        source: String(parsed.source || 'Personal Note'),
+        title,
+        source,
         sourceType: 'txt',
         category,
-        tags: normalizeTags(parsed.tags, category),
+        tags,
         url: trimmedUrl || undefined,
-        summary: String(parsed.summary || content.slice(0, 220)),
-        keyFacts: Array.isArray(parsed.keyFacts) ? parsed.keyFacts.map(String).slice(0, 4) : [],
+        summary,
+        keyFacts,
         content,
         passages,
-        estimatedReadMinutes: Number(parsed.estimatedReadMinutes) || computedMinutes,
+        estimatedReadMinutes,
       },
     });
   } catch (err) {
@@ -1021,7 +1269,6 @@ app.post('/api/sources/tag', async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
     const batch = sources.slice(0, 20);
     const sourceDigest = batch
       .map(
@@ -1030,47 +1277,52 @@ app.post('/api/sources/tag', async (req, res) => {
       )
       .join('\n\n');
 
-    const response = await withRetry(() =>
-      ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Assign 2 to 3 crisp, context-relevant newsroom tags to each source below.\n\n${sourceDigest}`,
-        config: {
-          systemInstruction:
-            'You are a newsroom taxonomy editor. For each source, return 2 to 3 concise 1-2 word tags such as "Tech", "Economy", "Politics", "Climate", "Energy", "AI", "Policy", "Markets", "Transit", "Health", "Science", "Europe", "World", or "Finance". Prefer standardized short labels so related articles share tags cleanly.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              items: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  },
-                  required: ['id', 'tags'],
-                },
-              },
-            },
-            required: ['items'],
-          },
-        },
-      })
-    );
-
-    const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-      items?: Array<{ id?: string; tags?: unknown }>;
-    };
-
     const tagsById: Record<string, string[]> = {};
     const fallbackById = new Map(batch.map((s) => [s.id, s.category]));
 
-    if (Array.isArray(parsed.items)) {
-      for (const item of parsed.items) {
-        if (!item?.id) continue;
-        tagsById[item.id] = normalizeTags(item.tags, fallbackById.get(item.id));
+    try {
+      const ai = getGeminiClient();
+      const response = await withTextModelFallback((model) =>
+        ai.models.generateContent({
+          model,
+          contents: `Assign 2 to 3 crisp, context-relevant newsroom tags to each source below.\n\n${sourceDigest}`,
+          config: {
+            systemInstruction:
+              'You are a newsroom taxonomy editor. For each source, return 2 to 3 concise 1-2 word tags such as "Tech", "Economy", "Politics", "Climate", "Energy", "AI", "Policy", "Markets", "Transit", "Health", "Science", "Europe", "World", or "Finance". Prefer standardized short labels so related articles share tags cleanly.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                items: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    },
+                    required: ['id', 'tags'],
+                  },
+                },
+              },
+              required: ['items'],
+            },
+          },
+        })
+      );
+
+      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        items?: Array<{ id?: string; tags?: unknown }>;
+      };
+
+      if (Array.isArray(parsed.items)) {
+        for (const item of parsed.items) {
+          if (!item?.id) continue;
+          tagsById[item.id] = normalizeTags(item.tags, fallbackById.get(item.id));
+        }
       }
+    } catch {
+      // Fall back to category-derived tags if Gemini is rate-limited
     }
 
     for (const s of batch) {
@@ -1170,9 +1422,9 @@ app.post('/api/briefings/generate', async (req, res) => {
       required: ['marker', 'sourceIndex', 'passageIndex', 'excerpt'],
     };
 
-    const response = await withRetry(() =>
+    const response = await withTextModelFallback((model) =>
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model,
         contents: `Create a personalized ${preferences.durationMinutes}-minute commute audio briefing (~${targetWords} total spoken words across all segments) grounded in these ${articles.length} sources.\n\n${sourcesContext}`,
         config: {
           systemInstruction: `You are the Executive Producer of Dispatch, a premier personalized commute audio newsroom and research notebook.
@@ -1186,7 +1438,8 @@ STRUCTURAL & CITATION RULES:
 2. Create 1 segment per major source (keeping each segment roughly 120-260 words for smooth audio synthesis).
 3. Include 3 to 5 crisp, high-signal "takeaways". Cite supporting passages inline at the end of key takeaway claims using bracketed numbers like [1], [2], and provide the matching entries in "takeawayCitations" (where sourceIndex is the 1-based SOURCE number and passageIndex is the 1-based P number from [S#-P#]).
 4. Inside each segment's spoken "lines", embed 2 to 4 subtle inline citation markers like [1], [2] right after major factual claims, and populate that segment's "citations" array (starting markers at 1 per segment) mapping each marker to the exact sourceIndex, passageIndex, and a brief verbatim excerpt from that passage. (Our TTS engine automatically strips [1] markers when recording voice audio, so listeners get both clean audio and clickable transcript citations.)
-5. Strictly ground all facts, figures, names, and claims in the provided sources—never invent statistics or events not present in the sources.`,
+5. Strictly ground all facts, figures, names, and claims in the provided sources—never invent statistics or events not present in the sources.
+6. Whenever a source includes USER-HIGHLIGHTED PASSAGES, treat those listener-highlighted phrases, quotes, and numbers as top-priority reference signals: explicitly weave their core insights into the corresponding segment's spoken script and executive takeaways, and cite their matching [S#-P#] passage markers.`,
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -1305,6 +1558,195 @@ STRUCTURAL & CITATION RULES:
     });
   } catch (err) {
     const { status, message } = formatApiError(err);
+      res.status(status).json({ error: message });
+    }
+  });
+
+// 2B. Synthesize a cross-article meta-briefing summary from collected user highlights
+app.post('/api/highlights/summarize', async (req, res) => {
+  try {
+    const { articles, listenerFocus, tone } = req.body as {
+      articles?: IncomingArticle[];
+      listenerFocus?: string;
+      tone?: string;
+    };
+
+    const highlightedArticles = (Array.isArray(articles) ? articles : []).filter(
+      (a) =>
+        Array.isArray(a.highlights) &&
+        a.highlights.some((h) => String(h?.text || '').trim().length >= 2)
+    );
+
+    if (highlightedArticles.length === 0) {
+      res.status(400).json({
+        error:
+          'Highlight at least one phrase inside an article snippet to generate a meta-briefing summary.',
+      });
+      return;
+    }
+
+    let totalHighlightCount = 0;
+    const dossierBlocks = highlightedArticles.map((a, idx) => {
+      const sNum = idx + 1;
+      const passages =
+        Array.isArray(a.passages) && a.passages.length > 0
+          ? a.passages
+          : buildPassages(a.id, a.content || a.summary);
+
+      const matchedPassageIndices = new Set<number>();
+      const highlightLines = (Array.isArray(a.highlights) ? a.highlights : [])
+        .map((h) => {
+          const text = String(h?.text || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+          if (text.length < 2) return null;
+          let pIdx = Number(h?.passageIndex) || 0;
+          if (pIdx < 1 || pIdx > passages.length) {
+            const matched = passages.find((p) =>
+              p.text.replace(/\s+/g, ' ').toLowerCase().includes(text.toLowerCase())
+            );
+            pIdx = matched ? matched.index : 1;
+          }
+          matchedPassageIndices.add(pIdx);
+          return `- [S${sNum}-P${pIdx}] "${text}"`;
+        })
+        .filter((line): line is string => Boolean(line))
+        .slice(0, 20);
+
+      totalHighlightCount += highlightLines.length;
+
+      const contextPassages = passages
+        .filter((p) => matchedPassageIndices.has(p.index) || p.index <= 2)
+        .slice(0, 8)
+        .map((p) => `[S${sNum}-P${p.index}] ${p.text}`)
+        .join('\n');
+
+      return `SOURCE ${sNum}:
+Title: ${a.title}
+Origin: ${a.source} (${a.sourceType || 'article'} · ${a.category})
+Article Summary: ${a.summary}
+COLLECTED USER HIGHLIGHTS:
+${highlightLines.join('\n')}
+Supporting Passages:
+${contextPassages}`;
+    });
+
+    const ai = getGeminiClient();
+    const focusInstruction =
+      typeof listenerFocus === 'string' && listenerFocus.trim()
+        ? `LISTENER ANGLE: "${listenerFocus.trim()}". Emphasize connections and implications relevant to this angle.`
+        : 'LISTENER ANGLE: Synthesize overarching patterns, tensions, quantitative evidence, and strategic implications across the collected highlights.';
+    const toneLabel =
+      typeof tone === 'string' && tone.trim() ? tone.trim() : 'executive';
+
+    const citationSchemaItem = {
+      type: Type.OBJECT,
+      properties: {
+        marker: { type: Type.INTEGER },
+        sourceIndex: { type: Type.INTEGER },
+        passageIndex: { type: Type.INTEGER },
+        excerpt: { type: Type.STRING },
+      },
+      required: ['marker', 'sourceIndex', 'passageIndex', 'excerpt'],
+    };
+
+    const response = await withTextModelFallback((model) =>
+      ai.models.generateContent({
+        model,
+        contents: `Synthesize a cohesive meta-briefing summary from ${totalHighlightCount} user-collected highlights across ${highlightedArticles.length} ${
+          highlightedArticles.length === 1 ? 'source' : 'sources'
+        }.\n\n${dossierBlocks.join('\n\n---\n\n')}`,
+        config: {
+          systemInstruction: `You are the Chief Research Editor of Dispatch. The reader has curated specific highlighted passages across their reading queue and wants a synthesized Meta-Briefing Summary.
+TONE: ${toneLabel} — crisp, high-signal newsroom prose with zero filler.
+${focusInstruction}
+
+SYNTHESIS & CITATION RULES:
+1. Create a sharp editorial "title" (5-10 words) and a 1-sentence "subtitle" capturing the unifying thesis across the highlights.
+2. Write "executiveOverview" as 2 concise paragraphs (separated by "\\n\\n", ~120-200 words total) synthesizing how the highlighted passages connect, corroborate, or contrast with one another.
+3. Produce 2 to 4 thematic threads in "themes", each with a concise "heading", a 2-3 sentence "synthesis", and "sourceTitles" listing the source titles contributing to that theme.
+4. Produce 3 to 5 crisp, actionable "keyTakeaways" grounded directly in the highlighted passages.
+5. Embed numbered inline citation markers like [1], [2], [3] (using a single unified numbering sequence across executiveOverview, themes, and keyTakeaways starting at [1]) immediately after claims and figures, and map every marker in "citations" using the 1-based SOURCE number ("sourceIndex"), 1-based P number ("passageIndex") from [S#-P#], and a brief verbatim "excerpt".
+6. Never invent facts, numbers, or claims outside the provided highlights and supporting passages.`,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              subtitle: { type: Type.STRING },
+              executiveOverview: { type: Type.STRING },
+              themes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    heading: { type: Type.STRING },
+                    synthesis: { type: Type.STRING },
+                    sourceTitles: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                    },
+                  },
+                  required: ['heading', 'synthesis', 'sourceTitles'],
+                },
+              },
+              keyTakeaways: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+              citations: {
+                type: Type.ARRAY,
+                items: citationSchemaItem,
+              },
+            },
+            required: [
+              'title',
+              'subtitle',
+              'executiveOverview',
+              'themes',
+              'keyTakeaways',
+              'citations',
+            ],
+          },
+        },
+      })
+    );
+
+    const parsed = JSON.parse((response.text ?? '{}').trim()) as Record<string, unknown>;
+    const themes = Array.isArray(parsed.themes)
+      ? (parsed.themes as Array<Record<string, unknown>>)
+          .map((t) => ({
+            heading: String(t?.heading || '').trim(),
+            synthesis: String(t?.synthesis || '').trim(),
+            sourceTitles: Array.isArray(t?.sourceTitles)
+              ? t.sourceTitles.map(String).filter(Boolean)
+              : [],
+          }))
+          .filter((t) => t.heading && t.synthesis)
+      : [];
+
+    const keyTakeaways = Array.isArray(parsed.keyTakeaways)
+      ? parsed.keyTakeaways.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+
+    res.json({
+      metaSummary: {
+        id: `meta_${Date.now().toString(36)}`,
+        createdAt: new Date().toISOString(),
+        title: String(parsed.title || 'Highlights Meta-Briefing Summary').trim(),
+        subtitle: String(
+          parsed.subtitle ||
+            `Synthesized from ${totalHighlightCount} highlighted passages across ${highlightedArticles.length} sources.`
+        ).trim(),
+        executiveOverview: String(parsed.executiveOverview || '').trim(),
+        themes,
+        keyTakeaways,
+        citations: resolveCitations(parsed.citations, highlightedArticles),
+        sourceCount: highlightedArticles.length,
+        highlightCount: totalHighlightCount,
+        sourceTitles: highlightedArticles.map((a) => a.title),
+      },
+    });
+  } catch (err) {
+    const { status, message } = formatApiError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1343,9 +1785,9 @@ app.post('/api/briefings/refine', async (req, res) => {
         ? 'Preserve two-speaker podcast dialogue using strictly "Alex" and "Sam" as speaker names.'
         : 'Preserve single-speaker broadcast format using strictly "Anchor" as the speaker name.';
 
-    const response = await withRetry(() =>
+    const response = await withTextModelFallback((model) =>
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model,
         contents: `Rewrite the following audio briefing segment(s) according to this editorial note: "${instruction.trim()}"\n\nCurrent segments JSON:\n${JSON.stringify(scopeSegments, null, 2)}`,
         config: {
           systemInstruction: `You are a senior radio script editor refining a commute audio briefing. Keep exact segment IDs, preserve existing inline citation markers like [1], [2] where claims remain, improve spoken rhythm, and follow the user's editorial instruction precisely. ${speakerRule}`,
@@ -1529,38 +1971,70 @@ app.post('/api/tts/synthesize', async (req, res) => {
         },
       }));
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash-tts',
-          contents: [
-            {
-              role: 'user',
-              parts,
-            },
-          ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              multiSpeakerVoiceConfig: {
-                speakerVoiceConfigs: [
-                  {
-                    speaker: 'Alex',
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: primaryVoice },
+      const response = await withTtsModelFallback(async (ttsModel) => {
+        try {
+          return await ai.models.generateContent({
+            model: ttsModel,
+            contents: [
+              {
+                role: 'user',
+                parts,
+              },
+            ],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                multiSpeakerVoiceConfig: {
+                  speakerVoiceConfigs: [
+                    {
+                      speaker: 'Alex',
+                      voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: primaryVoice },
+                      },
                     },
-                  },
-                  {
-                    speaker: 'Sam',
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: secondaryVoice },
+                    {
+                      speaker: 'Sam',
+                      voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: secondaryVoice },
+                      },
                     },
-                  },
-                ],
+                  ],
+                },
               },
             },
-          },
-        })
-      );
+          });
+        } catch (ttsErr) {
+          const msg = ttsErr instanceof Error ? ttsErr.message : String(ttsErr);
+          if (ttsModel === 'gemini-3.8-flash-lite-tts' && msg.includes('400')) {
+            const combinedDialogue = cleanedLines
+              .map((l) => `${l.speaker}: ${l.text}`)
+              .join('\n\n');
+            return await ai.models.generateContent({
+              model: ttsModel,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: combinedDialogue,
+                      speechMetadata: { style: selectedStyle.solo },
+                    },
+                  ],
+                },
+              ],
+              config: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: primaryVoice },
+                  },
+                },
+              },
+            });
+          }
+          throw ttsErr;
+        }
+      });
 
       const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
       if (!inlineData?.data) {
@@ -1590,9 +2064,9 @@ app.post('/api/tts/synthesize', async (req, res) => {
       return;
     }
 
-    const response = await withRetry(() =>
+    const response = await withTtsModelFallback((ttsModel) =>
       ai.models.generateContent({
-        model: 'gemini-3.8-flash-tts',
+        model: ttsModel,
         contents: [
           {
             role: 'user',
@@ -1681,40 +2155,40 @@ ${sourcesContext}${briefingContext}`;
       parts: [{ text: m.text }],
     }));
 
-    const chat = ai.chats.create({
-      model: 'gemini-4-hydrogen',
-      history,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reply: { type: Type.STRING },
-            citations: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  marker: { type: Type.INTEGER },
-                  sourceIndex: { type: Type.INTEGER },
-                  passageIndex: { type: Type.INTEGER },
-                  excerpt: { type: Type.STRING },
+    const response = await withTextModelFallback(async (model) => {
+      const chat = ai.chats.create({
+        model,
+        history,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: { type: Type.STRING },
+              citations: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    marker: { type: Type.INTEGER },
+                    sourceIndex: { type: Type.INTEGER },
+                    passageIndex: { type: Type.INTEGER },
+                    excerpt: { type: Type.STRING },
+                  },
+                  required: ['marker', 'sourceIndex', 'passageIndex', 'excerpt'],
                 },
-                required: ['marker', 'sourceIndex', 'passageIndex', 'excerpt'],
               },
             },
+            required: ['reply', 'citations'],
           },
-          required: ['reply', 'citations'],
         },
-      },
-    });
+      });
 
-    const response = await withRetry(() =>
-      chat.sendMessage({
+      return chat.sendMessage({
         message: latest.text.trim(),
-      })
-    );
+      });
+    });
 
     const rawText = (response.text ?? '').trim();
     try {
@@ -2454,9 +2928,9 @@ app.post('/api/mockup/extract-colors', async (req, res) => {
         .filter(Boolean)
         .join('\n\n');
 
-      const response = await withRetry(() =>
+      const response = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Inspect the extracted stylesheet colour tokens and page context below and curate a 5 to 6 colour Brand Swatch Library representing this website's dominant brand identity.\n\n${prompt}`,
           config: {
             systemInstruction:
@@ -2470,9 +2944,9 @@ app.post('/api/mockup/extract-colors', async (req, res) => {
       parsed = JSON.parse((response.text ?? '{}').trim());
     } else {
       usedFallback = true;
-      const searchResp = await withRetry(() =>
+      const searchResp = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Look up the real brand and website at ${parsedUrl.toString()} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string), suggestedPrimary (6-digit #RRGGBB), suggestedAccent (6-digit #RRGGBB), suggestedCanvasMode ("light" or "dark"), and swatches (array of 5 to 6 objects each with hex #RRGGBB, name, role one of "primary"|"accent"|"surface"|"neutral", and short usageNote). Use the business's authentic brand colours and industry palette.`,
           config: {
             tools: [{ googleSearch: {} }],
@@ -2691,9 +3165,9 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
         .filter(Boolean)
         .join('\n\n');
 
-      const response = await withRetry(() =>
+      const response = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Recommend 4 distinct, production-grade Google Font pairings tailored to this website and business identity.\n\n${contextBlock}`,
           config: {
             systemInstruction: `You are a senior typographer and brand designer. ${allowedCatalogNote} Return exactly 4 distinct pairings with varied character (e.g., faithful/upgraded site match, clean modern, editorial/heritage, bold trade/display). If the website already uses a valid Google Font, include an upgraded pairing honoring it as the first option. For each pairing return: name (2–3 words), headingFont (exact Google Fonts family name), bodyFont (exact Google Fonts family name), monoFont (exact Google Fonts mono family name), headingCategory ("sans-serif" | "serif" | "display"), bodyCategory ("sans-serif" | "serif"), mood ("industrial" | "editorial" | "modern"), rationale (crisp 10–18 word explanation why it suits this business), and sourceNote (short 2–4 word origin label like "Matches site font" or "Modern upgrade").`,
@@ -2706,9 +3180,9 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
       parsed = JSON.parse((response.text ?? '{}').trim());
     } else {
       usedFallback = true;
-      const searchResp = await withRetry(() =>
+      const searchResp = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Look up the real business website at ${parsedUrl.toString()}${
             brandName ? ` (${brandName})` : ''
           } and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string) and pairings (array of 4 objects each with: name, headingFont, bodyFont, monoFont, headingCategory one of "sans-serif"|"serif"|"display", bodyCategory one of "sans-serif"|"serif", mood one of "industrial"|"editorial"|"modern", rationale, sourceNote). ${allowedCatalogNote}`,
@@ -2950,9 +3424,9 @@ app.post('/api/mockup/analyze', async (req, res) => {
         .filter(Boolean)
         .join('\n\n');
 
-      const response = await withRetry(() =>
+      const response = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Analyze the business information below and produce a clean, modern, conversion-focused website redesign mockup tailored to their exact industry and brand colours.\n\n${prompt}`,
           config: {
             systemInstruction:
@@ -2967,9 +3441,9 @@ app.post('/api/mockup/analyze', async (req, res) => {
     } else {
       // Site blocked direct fetch (e.g. Cloudflare) — try Google Search grounding to gather real info
       usedFallback = true;
-      const searchResp = await withRetry(() =>
+      const searchResp = await withTextModelFallback((model) =>
         ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model,
           contents: `Look up the real business website at ${normalizedUrl} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brand ({ name, industry, serviceArea, phone, email, hours, address, primaryHex, accentHex, canvasMode, fontMood }), brandSwatches ([{ hex, name, role, usageNote }]), hero ({ kicker, headline, subheadline, primaryCta, secondaryCta, trustHighlights }), services ([{ title, description, deliverable }]), projects ([{ title, location, metric, summary }]), about ({ heading, story, credentials }), quoteForm ({ heading, subtext, submitLabel }). Use authentic details for this business and a tailored 6-digit hex palette.`,
           config: {
             tools: [{ googleSearch: {} }],
@@ -3163,9 +3637,9 @@ app.post('/api/mockup/rewrite', async (req, res) => {
       },
     };
 
-    const response = await withRetry(() =>
+    const response = await withTextModelFallback((model) =>
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model,
         contents: `BUSINESS CONTEXT: ${brandSummary}\n\nCURRENT "${section.toUpperCase()}" SECTION:\n${JSON.stringify(currentData, null, 2)}\n\nREVISION INSTRUCTION: "${instruction.trim()}"`,
         config: {
           systemInstruction:

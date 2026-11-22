@@ -1,8 +1,9 @@
 export type SuiteChatModelId =
-  | 'gemini-4-carbon'
-  | 'gemini-4-neon'
+  | 'gemini-3.5-flash-lite'
+  | 'gemini-3.1-flash-lite'
   | 'gemini-4-hydrogen'
-  | 'gemini-3.1-flash-lite';
+  | 'gemini-4-neon'
+  | 'gemini-4-carbon';
 
 export interface SuiteChatModelOption {
   id: SuiteChatModelId;
@@ -13,16 +14,16 @@ export interface SuiteChatModelOption {
 
 export const SUITE_CHAT_MODELS: SuiteChatModelOption[] = [
   {
-    id: 'gemini-4-carbon',
-    label: 'Gemini 4 Carbon',
-    tier: 'Deep Reasoning',
-    description: 'Complex strategy, architecture, and multi-step editorial analysis.',
+    id: 'gemini-3.5-flash-lite',
+    label: 'Gemini 3.5 Flash-Lite',
+    tier: 'Default · High Limit',
+    description: 'Fast, high-quota default for everyday research, briefings, and structured chat.',
   },
   {
-    id: 'gemini-4-neon',
-    label: 'Gemini 4 Neon',
-    tier: 'Interactive Pro',
-    description: 'High-nuance creative drafting, structured problem solving, and code.',
+    id: 'gemini-3.1-flash-lite',
+    label: 'Gemini 3.1 Flash-Lite',
+    tier: 'Ultra Fast',
+    description: 'Instant iterations, quick rewrites, and low-latency fallback Q&A.',
   },
   {
     id: 'gemini-4-hydrogen',
@@ -31,10 +32,16 @@ export const SUITE_CHAT_MODELS: SuiteChatModelOption[] = [
     description: 'Everyday research, briefings, and fast conversational work.',
   },
   {
-    id: 'gemini-3.1-flash-lite',
-    label: 'Gemini 3.1 Flash-Lite',
-    tier: 'Ultra Fast',
-    description: 'Instant iterations, quick rewrites, and low-latency Q&A.',
+    id: 'gemini-4-neon',
+    label: 'Gemini 4 Neon',
+    tier: 'Interactive Pro',
+    description: 'High-nuance creative drafting, structured problem solving, and code.',
+  },
+  {
+    id: 'gemini-4-carbon',
+    label: 'Gemini 4 Carbon',
+    tier: 'Deep Reasoning',
+    description: 'Complex strategy, architecture, and multi-step editorial analysis.',
   },
 ];
 

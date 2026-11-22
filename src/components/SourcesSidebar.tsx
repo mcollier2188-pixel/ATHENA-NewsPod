@@ -28,6 +28,8 @@ interface SourcesSidebarProps {
   isTagging: boolean;
   isRefreshingArticles: boolean;
   refreshArticlesStatus: string | null;
+  queueTab?: 'active' | 'readLater';
+  onQueueTabChange?: (tab: 'active' | 'readLater') => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onOpenAddModal: (tab?: 'upload' | 'drive' | 'url' | 'text') => void;
@@ -76,6 +78,8 @@ export function SourcesSidebar({
   isTagging,
   isRefreshingArticles,
   refreshArticlesStatus,
+  queueTab,
+  onQueueTabChange,
   mobileOpen,
   onCloseMobile,
   onOpenAddModal,
@@ -91,8 +95,21 @@ export function SourcesSidebar({
   onRefreshAllArticles,
 }: SourcesSidebarProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const [drawerTab, setDrawerTab] = useState<'notebook' | 'readLater'>('notebook');
+  const [internalDrawerTab, setInternalDrawerTab] = useState<'notebook' | 'readLater'>(
+    'notebook'
+  );
   const [activeTag, setActiveTag] = useState<string | null>(null);
+
+  const drawerTab: 'notebook' | 'readLater' = queueTab
+    ? queueTab === 'readLater'
+      ? 'readLater'
+      : 'notebook'
+    : internalDrawerTab;
+
+  const setDrawerTab = (next: 'notebook' | 'readLater') => {
+    setInternalDrawerTab(next);
+    onQueueTabChange?.(next === 'readLater' ? 'readLater' : 'active');
+  };
 
   const notebookSources = useMemo(
     () => sources.filter((s) => !s.readLater),

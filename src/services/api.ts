@@ -2,9 +2,11 @@ import type {
   AudioBriefing,
   BriefingPreferences,
   BriefingSegment,
+  BriefingTone,
   CitationRef,
   CreateMockupShareResult,
   CreateShareResult,
+  HighlightsMetaSummary,
   MockupCanvasMode,
   MockupColorSwatch,
   NewsArticle,
@@ -154,6 +156,18 @@ export async function refineBriefingScript(payload: {
 }): Promise<BriefingSegment[]> {
   const res = await postJson<{ segments: BriefingSegment[] }>('/api/briefings/refine', payload);
   return res.segments;
+}
+
+export async function generateHighlightsMetaSummary(payload: {
+  articles: NewsArticle[];
+  listenerFocus?: string;
+  tone?: BriefingTone;
+}): Promise<HighlightsMetaSummary> {
+  const res = await postJson<{ metaSummary: HighlightsMetaSummary }>(
+    '/api/highlights/summarize',
+    payload
+  );
+  return res.metaSummary;
 }
 
 export async function synthesizeSpeech(payload: {

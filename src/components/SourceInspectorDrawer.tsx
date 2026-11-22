@@ -1,13 +1,70 @@
-import { useEffect, useRef } from 'react';
-import { Bookmark, BookmarkCheck, ExternalLink, X } from 'lucide-react';
-import type { InspectedSourceTarget, NewsArticle } from '../types';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  Bookmark,
+  BookmarkCheck,
+  Check,
+  Copy,
+  ExternalLink,
+  Highlighter,
+  X,
+} from 'lucide-react';
+import type { ArticleHighlight, InspectedSourceTarget, NewsArticle } from '../types';
 import { ensureArticlePassages } from '../utils/passages';
+import {
+  copyTextToClipboard,
+  formatArticleHighlightsMarkdown,
+} from '../utils/highlightMarkdown';
 
 interface SourceInspectorDrawerProps {
   target: InspectedSourceTarget | null;
   sources: NewsArticle[];
   onClose: () => void;
   onToggleReadLater?: (sourceId: string) => void;
+  onRemoveHighlight?: (sourceId: string, highlightId?: string) => void;
+  onSelectHighlightPassage?: (
+    sourceId: string,
+    passageIndex: number,
+    excerpt: string
+  ) => void;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function renderPassageWithHighlights(
+  text: string,
+  highlights?: ArticleHighlight[]
+): ReactNode {
+  const validPhrases = Array.from(
+    new Set(
+      (highlights || [])
+        .map((h) => h.text.replace(/\s+/g, ' ').trim())
+        .filter((p) => p.length >= 2)
+    )
+  ).sort((a, b) => b.length - a.length);
+
+  if (validPhrases.length === 0 || !text) return text;
+
+  const pattern = new RegExp(
+    `(${validPhrases.map((p) => escapeRegExp(p).replace(/\s+/g, '\\s+')).join('|')})`,
+    'gi'
+  );
+  const parts = text.split(pattern);
+  if (parts.length <= 1) return text;
+
+  return parts.map((part, idx) =>
+    idx % 2 === 1 ? (
+      <mark
+        key={idx}
+        className="bg-[#22D3EE]/20 text-[#ECFEFF] border-b border-[#22D3EE]/70 rounded-xs px-0.5"
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    )
+  );
 }
 
 export function SourceInspectorDrawer({
@@ -15,13 +72,18 @@ export function SourceInspectorDrawer({
   sources,
   onClose,
   onToggleReadLater,
+  onRemoveHighlight,
+  onSelectHighlightPassage,
 }: SourceInspectorDrawerProps) {
   const highlightedPassageRef = useRef<HTMLDivElement | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const [copiedHighlights, setCopiedHighlights] = useState(false);
 
   const rawSource = target ? sources.find((s) => s.id === target.sourceId) : null;
   const source = rawSource ? ensureArticlePassages(rawSource) : null;
 
   useEffect(() => {
+    setCopiedHighlights(false);
     if (target?.passageIndex && highlightedPassageRef.current) {
       highlightedPassageRef.current.scrollIntoView({
         behavior: 'smooth',
@@ -30,16 +92,25 @@ export function SourceInspectorDrawer({
     }
   }, [target?.sourceId, target?.passageIndex]);
 
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
   if (!target || !source) return null;
 
   const passages = source.passages || [];
+  const highlights = source.highlights || [];
 
   return (
     <div
       role="dialog"
       aria-modal="false"
       aria-label={`Source Inspector: ${source.title}`}
-      className="fixed inset-y-0 right-0 z-40 w-full sm:w-[440px] lg:w-[460px] bg-[#11141A] border-l border-[#22D3EE]/40 shadow-2xl flex flex-col"
+      className="fixed inset-y-0 right-0 z-50 w-full sm:w-[440px] lg:w-[460px] bg-[#11141A] border-l border-[#22D3EE]/40 shadow-2xl flex flex-col"
     >
       {/* Inspector Header */}
       <div className="px-6 py-4 border-b border-[#222833] flex items-start justify-between gap-4">
@@ -140,6 +211,99 @@ export function SourceInspectorDrawer({
               </ul>
             </div>
           )}
+
+          {highlights.length > 0 && (
+            <div className="pt-2.5 border-t border-[#1E2430] space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-[#F5F7FA]">
+                  <Highlighter className="w-3.5 h-3.5 text-[#22D3EE]" aria-hidden="true" />
+                  <span>Saved Highlights</span>
+                  <span aria-hidden="true" className="text-[#4B5565]">
+                    ·
+                  </span>
+                  <span className="font-mono text-[11px] text-[#67E8F9] tabular-nums">
+                    {highlights.length}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const md = formatArticleHighlightsMarkdown(source);
+                      if (!md) return;
+                      const ok = await copyTextToClipboard(md);
+                      if (ok) {
+                        setCopiedHighlights(true);
+                        if (copyTimerRef.current !== null) {
+                          window.clearTimeout(copyTimerRef.current);
+                        }
+                        copyTimerRef.current = window.setTimeout(() => {
+                          setCopiedHighlights(false);
+                          copyTimerRef.current = null;
+                        }, 2200);
+                      }
+                    }}
+                    aria-live="polite"
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#67E8F9] hover:text-[#22D3EE] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {copiedHighlights ? (
+                      <>
+                        <Check className="w-3 h-3" aria-hidden="true" />
+                        <span>Copied Markdown</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" aria-hidden="true" />
+                        <span>Copy to Clipboard</span>
+                      </>
+                    )}
+                  </button>
+                  {onRemoveHighlight && (
+                    <button
+                      type="button"
+                      onClick={() => onRemoveHighlight(source.id)}
+                      className="text-[11px] text-[#8C96A8] hover:text-[#F87171] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Clear all
+                    </button>
+                  )}
+                </div>
+              </div>
+              <ul className="space-y-2 text-xs text-[#D5DCE6] leading-relaxed">
+                {highlights.map((hl) => (
+                  <li
+                    key={hl.id}
+                    className="flex items-start justify-between gap-2 pt-1.5 first:pt-0 border-t first:border-t-0 border-[#1A202B]"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[#E4E9F1]">“{hl.text}”</p>
+                      {hl.passageIndex > 0 && onSelectHighlightPassage && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onSelectHighlightPassage(source.id, hl.passageIndex, hl.text)
+                          }
+                          className="mt-0.5 font-mono text-[11px] text-[#67E8F9] hover:text-[#22D3EE] hover:underline tabular-nums whitespace-nowrap cursor-pointer"
+                        >
+                          Jump to Passage {hl.passageIndex}
+                        </button>
+                      )}
+                    </div>
+                    {onRemoveHighlight && (
+                      <button
+                        type="button"
+                        onClick={() => onRemoveHighlight(source.id, hl.id)}
+                        aria-label={`Remove highlight "${hl.text.slice(0, 40)}"`}
+                        className="p-1 text-[#6E788A] hover:text-[#F87171] rounded transition-colors shrink-0 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" aria-hidden="true" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
 
         {/* Indexed Passages */}
@@ -180,7 +344,9 @@ export function SourceInspectorDrawer({
                       </span>
                     )}
                   </div>
-                  <p className="text-sm text-[#E4E9F1] leading-[1.7]">{p.text}</p>
+                  <p className="text-sm text-[#E4E9F1] leading-[1.7]">
+                    {renderPassageWithHighlights(p.text, highlights)}
+                  </p>
                 </div>
               );
             })}

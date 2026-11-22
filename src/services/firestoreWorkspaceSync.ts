@@ -14,6 +14,7 @@ import {
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/firestoreError';
 import type {
+  ArticleHighlight,
   AudioBriefing,
   BriefingPreferences,
   BriefingSegment,
@@ -216,6 +217,45 @@ function sanitizePlaybackMap(pos?: Partial<PlaybackPosition> | FirestorePlayback
   };
 }
 
+function sanitizeHighlightList(
+  rawHighlights?: ArticleHighlight[] | unknown
+): ArticleHighlight[] {
+  if (!Array.isArray(rawHighlights)) return [];
+  const seen = new Set<string>();
+  const cleaned: ArticleHighlight[] = [];
+
+  for (let i = 0; i < rawHighlights.length; i++) {
+    const item = rawHighlights[i] as Partial<ArticleHighlight> | null | undefined;
+    if (!item || typeof item !== 'object') continue;
+    const text = clampStr(item.text, 600, '');
+    if (text.length < 2) continue;
+    const dedupeKey = text.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const safeId = `hl_${sanitizeIdSuffix(item.id || `${i + 1}`, 64)}`;
+    const passageIndex = Math.round(
+      clampNumber(item.passageIndex, 0, 999, 0)
+    );
+    const createdAt = clampStr(
+      item.createdAt,
+      64,
+      new Date().toISOString()
+    );
+
+    cleaned.push({
+      id: safeId,
+      text,
+      passageIndex,
+      createdAt,
+    });
+
+    if (cleaned.length >= 20) break;
+  }
+
+  return cleaned;
+}
+
 function buildMutableSourceFields(article: NewsArticle) {
   return {
     title: clampStr(article.title, 300, 'Untitled Source'),
@@ -233,6 +273,7 @@ function buildMutableSourceFields(article: NewsArticle) {
       .map((f) => clampStr(f, 300))
       .filter((f) => f.length > 0)
       .slice(0, 12),
+    highlights: sanitizeHighlightList(article.highlights),
     content: typeof article.content === 'string' ? article.content.slice(0, 30000) : '',
     estimatedReadMinutes: Math.round(
       clampNumber(article.estimatedReadMinutes, 1, 240, 3)
@@ -249,6 +290,7 @@ function buildMutableSourceFields(article: NewsArticle) {
 }
 
 function parseSourceFromDoc(data: Record<string, unknown>): NewsArticle {
+  const highlights = sanitizeHighlightList(data.highlights);
   return ensureArticlePassages({
     id: clampStr(data.sourceId, 128, 'src-unknown'),
     title: clampStr(data.title, 300, 'Untitled Source'),
@@ -264,6 +306,7 @@ function parseSourceFromDoc(data: Record<string, unknown>): NewsArticle {
     keyFacts: Array.isArray(data.keyFacts)
       ? data.keyFacts.filter((k): k is string => typeof k === 'string')
       : [],
+    highlights: highlights.length > 0 ? highlights : undefined,
     content: typeof data.content === 'string' ? data.content : '',
     estimatedReadMinutes: clampNumber(data.estimatedReadMinutes, 1, 240, 3),
     selected: Boolean(data.selected),
@@ -326,6 +369,41 @@ export async function upsertNotebookSourceToFirestore(
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function updateNotebookSourceHighlightsInFirestore(
+  ownerId: string,
+  article: NewsArticle
+): Promise<void> {
+  const docId = buildSourceDocId(ownerId, article.id);
+  const path = `${SOURCES_COLLECTION}/${docId}`;
+  const docRef = doc(db, SOURCES_COLLECTION, docId);
+  const sanitizedHighlights = sanitizeHighlightList(article.highlights);
+
+  try {
+    const existing = await getDoc(docRef);
+    if (existing.exists()) {
+      await updateDoc(docRef, {
+        highlights: sanitizedHighlights,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const mutable = buildMutableSourceFields({
+        ...article,
+        highlights: sanitizedHighlights,
+      });
+      await setDoc(docRef, {
+        docId,
+        sourceId: clampStr(article.id, 128, 'src-1'),
+        ownerId,
+        ...mutable,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 

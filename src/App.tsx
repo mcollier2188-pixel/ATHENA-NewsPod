@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { BookOpen, Check, Copy, HardDrive, ListChecks, Plus } from 'lucide-react';
+import { Bookmark, BookOpen, Check, Copy, HardDrive, ListChecks, Plus } from 'lucide-react';
 import {
   VOICE_OPTIONS,
   type ActiveView,
+  type ArticleHighlight,
   type AudioBriefing,
   type BriefingPreferences,
   type ChatMessage,
   type CitationRef,
+  type HighlightsMetaSummary,
   type InspectedSourceTarget,
   type LocalRssFeedConfig,
   type NewsArticle,
@@ -24,6 +26,7 @@ import {
 import { SAMPLE_ARTICLES } from './data/sampleArticles';
 import {
   generateBriefingScript,
+  generateHighlightsMetaSummary,
   generateSourceTags,
   ingestArticle,
   refineBriefingScript,
@@ -42,10 +45,15 @@ import {
   saveSegmentAudio,
 } from './utils/audioCache';
 import { ensureArticlePassages } from './utils/passages';
+import { formatHighlightsMetaSummaryMarkdown } from './utils/highlightMarkdown';
 import { TopBar } from './components/TopBar';
 import { SourcesSidebar } from './components/SourcesSidebar';
 import { SourceInspectorDrawer } from './components/SourceInspectorDrawer';
 import { AddSourceModal, type AddSourceTab } from './components/AddSourceModal';
+import {
+  HighlightsSummaryModal,
+  type HighlightsSummaryScope,
+} from './components/HighlightsSummaryModal';
 import { GoogleDriveModal } from './components/GoogleDriveModal';
 import { GoogleTasksDrawer } from './components/GoogleTasksDrawer';
 import { ArticleDeskView } from './components/ArticleDeskView';
@@ -67,6 +75,7 @@ import {
   subscribeToNotebookSources,
   subscribeToWorkspaceLinks,
   updateBriefingPlaybackInFirestore,
+  updateNotebookSourceHighlightsInFirestore,
   upsertBriefingArchiveToFirestore,
   upsertNotebookSourceToFirestore,
   upsertWorkspaceLinkToFirestore,
@@ -240,6 +249,16 @@ export default function App() {
   );
   const [activeMediaImageId, setActiveMediaImageId] = useState<string | null>(null);
   const [routeWaypoints, setRouteWaypoints] = useState<RouteWaypoint[]>([]);
+  const [highlightsSummaryModalOpen, setHighlightsSummaryModalOpen] = useState(false);
+  const [highlightsMetaSummary, setHighlightsMetaSummary] =
+    useState<HighlightsMetaSummary | null>(null);
+  const [isGeneratingHighlightsSummary, setIsGeneratingHighlightsSummary] =
+    useState(false);
+  const [highlightsSummaryError, setHighlightsSummaryError] = useState<string | null>(
+    null
+  );
+  const [highlightsSummaryScope, setHighlightsSummaryScope] =
+    useState<HighlightsSummaryScope>('selected');
   const [transferToast, setTransferToast] = useState<TransferToastItem | null>(null);
   const transferToastTimerRef = useRef<number | null>(null);
 
@@ -430,6 +449,7 @@ export default function App() {
     'local'
   );
   const [mobileSourcesOpen, setMobileSourcesOpen] = useState(false);
+  const [deskQueueTab, setDeskQueueTab] = useState<'active' | 'readLater'>('active');
   const [inspectedTarget, setInspectedTarget] = useState<InspectedSourceTarget | null>(
     null
   );
@@ -575,6 +595,7 @@ export default function App() {
               a.selected,
               Boolean(a.readLater),
               a.tags ?? [],
+              (a.highlights ?? []).map((h) => `${h.id}:${h.passageIndex}:${h.text}`),
               a.driveFileId ?? '',
               a.driveWebViewLink ?? '',
             ])
@@ -1600,7 +1621,7 @@ export default function App() {
           const extracted = await ingestArticle({ url: targetUrl });
           autoTagAttemptedIdsRef.current.add(target.id);
 
-          const updatedArticle = ensureArticlePassages({
+          const refreshedBase = ensureArticlePassages({
             ...target,
             ...extracted,
             id: target.id,
@@ -1614,8 +1635,25 @@ export default function App() {
               extracted.tags && extracted.tags.length > 0
                 ? extracted.tags
                 : target.tags,
+            highlights: target.highlights,
             passages: undefined,
           });
+          const updatedArticle: NewsArticle =
+            refreshedBase.highlights && refreshedBase.highlights.length > 0
+              ? {
+                  ...refreshedBase,
+                  highlights: refreshedBase.highlights.map((hl) => {
+                    const needle = hl.text.replace(/\s+/g, ' ').trim().toLowerCase();
+                    const matched = (refreshedBase.passages || []).find((p) =>
+                      p.text.replace(/\s+/g, ' ').toLowerCase().includes(needle)
+                    );
+                    return {
+                      ...hl,
+                      passageIndex: matched ? matched.index : hl.passageIndex,
+                    };
+                  }),
+                }
+              : refreshedBase;
 
           workingArticles = workingArticles.map((item) =>
             item.id === target.id ? updatedArticle : item
@@ -1681,6 +1719,209 @@ export default function App() {
   const handleInspectSource = useCallback((sourceId: string) => {
     setInspectedTarget({ sourceId });
   }, []);
+
+  const handleInspectHighlight = useCallback(
+    (sourceId: string, passageIndex: number, excerpt: string) => {
+      setInspectedTarget({
+        sourceId,
+        passageIndex: passageIndex > 0 ? passageIndex : undefined,
+        excerpt,
+      });
+    },
+    []
+  );
+
+  const handleAddArticleHighlight = useCallback(
+    (articleId: string, rawPhrase: string) => {
+      const cleaned = rawPhrase.replace(/\s+/g, ' ').trim().slice(0, 600);
+      if (cleaned.length < 2) return;
+
+      let syncedTarget: NewsArticle | null = null;
+      setArticles((prev) => {
+        const next = prev.map((item) => {
+          if (item.id !== articleId) return item;
+          const indexed = ensureArticlePassages(item);
+          const existingHighlights = indexed.highlights ?? [];
+          const lowerCleaned = cleaned.toLowerCase();
+          if (existingHighlights.some((h) => h.text.toLowerCase() === lowerCleaned)) {
+            return item;
+          }
+
+          const passages = indexed.passages || [];
+          const exactPassage =
+            passages.find((p) =>
+              p.text.replace(/\s+/g, ' ').toLowerCase().includes(lowerCleaned)
+            ) ||
+            (lowerCleaned.length >= 24
+              ? passages.find((p) =>
+                  p.text
+                    .replace(/\s+/g, ' ')
+                    .toLowerCase()
+                    .includes(lowerCleaned.slice(0, 32))
+                )
+              : undefined);
+
+          const newHighlight: ArticleHighlight = {
+            id: `hl_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+            text: cleaned,
+            passageIndex: exactPassage ? exactPassage.index : 0,
+            createdAt: new Date().toISOString(),
+          };
+
+          const trimmedExisting =
+            existingHighlights.length >= 20
+              ? existingHighlights.slice(existingHighlights.length - 19)
+              : existingHighlights;
+
+          const updated: NewsArticle = {
+            ...indexed,
+            highlights: [...trimmedExisting, newHighlight],
+          };
+          syncedTarget = updated;
+          return updated;
+        });
+        articlesRef.current = next;
+        return next;
+      });
+
+      if (syncedTarget && verifiedOwnerId) {
+        void updateNotebookSourceHighlightsInFirestore(verifiedOwnerId, syncedTarget);
+      }
+    },
+    [verifiedOwnerId]
+  );
+
+  const handleRemoveArticleHighlight = useCallback(
+    (articleId: string, highlightId?: string) => {
+      let syncedTarget: NewsArticle | null = null;
+      setArticles((prev) => {
+        const next = prev.map((item) => {
+          if (item.id !== articleId) return item;
+          const current = item.highlights ?? [];
+          if (current.length === 0) return item;
+          const nextHighlights = highlightId
+            ? current.filter((h) => h.id !== highlightId)
+            : [];
+          if (nextHighlights.length === current.length) return item;
+          const updated: NewsArticle = {
+            ...item,
+            highlights: nextHighlights,
+          };
+          syncedTarget = updated;
+          return updated;
+        });
+        articlesRef.current = next;
+        return next;
+      });
+
+      if (syncedTarget && verifiedOwnerId) {
+        void updateNotebookSourceHighlightsInFirestore(verifiedOwnerId, syncedTarget);
+      }
+    },
+    [verifiedOwnerId]
+  );
+
+  const handleGenerateHighlightsSummary = useCallback(
+    async (requestedScope?: HighlightsSummaryScope) => {
+      if (isGeneratingHighlightsSummary) return;
+
+      const snapshot = articlesRef.current;
+      const selectedWithHighlights = snapshot.filter(
+        (a) => !a.readLater && a.selected && (a.highlights?.length ?? 0) > 0
+      );
+      const allWithHighlights = snapshot.filter(
+        (a) => (a.highlights?.length ?? 0) > 0
+      );
+
+      let effectiveScope: HighlightsSummaryScope = requestedScope ?? highlightsSummaryScope;
+      if (effectiveScope === 'selected' && selectedWithHighlights.length === 0) {
+        effectiveScope = 'all';
+      }
+
+      const targetArticles =
+        effectiveScope === 'selected' && selectedWithHighlights.length > 0
+          ? selectedWithHighlights
+          : allWithHighlights;
+
+      setHighlightsSummaryScope(effectiveScope);
+      setHighlightsSummaryModalOpen(true);
+
+      if (targetArticles.length === 0) {
+        setHighlightsSummaryError(
+          'Highlight at least one phrase inside an article snippet to generate a meta-briefing summary.'
+        );
+        return;
+      }
+
+      setIsGeneratingHighlightsSummary(true);
+      setHighlightsSummaryError(null);
+      try {
+        const result = await generateHighlightsMetaSummary({
+          articles: targetArticles,
+          listenerFocus: preferences.listenerFocus,
+          tone: preferences.tone,
+        });
+        setHighlightsMetaSummary(result);
+      } catch (err) {
+        setHighlightsSummaryError(
+          err instanceof Error
+            ? err.message
+            : 'Could not synthesize summary from highlights.'
+        );
+      } finally {
+        setIsGeneratingHighlightsSummary(false);
+      }
+    },
+    [
+      highlightsSummaryScope,
+      isGeneratingHighlightsSummary,
+      preferences.listenerFocus,
+      preferences.tone,
+    ]
+  );
+
+  const handleSaveHighlightsSummaryAsSource = useCallback(
+    (summary: HighlightsMetaSummary) => {
+      const markdownBody = formatHighlightsMetaSummaryMarkdown(summary);
+      const wordCount = markdownBody.split(/\s+/).filter(Boolean).length;
+      const newSource = ensureArticlePassages({
+        id: `src-meta-${summary.id}`,
+        title: summary.title,
+        source: 'Highlights Meta-Briefing',
+        sourceType: 'markdown',
+        fileSizeLabel: `${Math.max(1, Math.round(markdownBody.length / 1024))} KB`,
+        category: 'Synthesis',
+        tags: ['Highlights', 'Meta-Briefing'],
+        summary: summary.subtitle,
+        keyFacts: summary.keyTakeaways.slice(0, 8),
+        content: markdownBody,
+        estimatedReadMinutes: Math.max(1, Math.round(wordCount / 210)),
+        selected: true,
+        readLater: false,
+        addedAt: new Date().toISOString(),
+      });
+
+      setArticles((prev) => {
+        const filtered = prev.filter((a) => a.id !== newSource.id);
+        const next = [newSource, ...filtered];
+        articlesRef.current = next;
+        return next;
+      });
+
+      if (verifiedOwnerId) {
+        void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
+      }
+
+      showTransferToast({
+        target: 'notebook',
+        title: 'Meta-Briefing Added to Active Sources',
+        description:
+          'Saved your synthesized highlights summary as a selected Markdown source.',
+        label: summary.title,
+      });
+    },
+    [showTransferToast, verifiedOwnerId]
+  );
 
   const handleSelectCitation = useCallback((citation: CitationRef) => {
     setInspectedTarget({
@@ -3245,9 +3486,37 @@ export default function App() {
       {isNewsroomView && (
         <div className="bg-[#0E1116] border-b border-[#22D3EE]/20 px-5 sm:px-7 py-2.5 flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-1.5 overflow-x-auto">
+            <button
+              type="button"
+              onClick={() => {
+                setActiveView('articles');
+                setDeskQueueTab('active');
+              }}
+              className={`h-9 px-3.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                activeView === 'articles' && deskQueueTab === 'active'
+                  ? 'bg-[#22D3EE]/15 text-[#67E8F9] border border-[#22D3EE]/45'
+                  : 'text-[#8C96A8] hover:text-[#F5F7FA] border border-transparent'
+              }`}
+            >
+              Studio Desk
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveView('articles');
+                setDeskQueueTab('readLater');
+              }}
+              className={`h-9 px-3.5 inline-flex items-center gap-1.5 text-xs font-medium rounded-md tabular-nums whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                activeView === 'articles' && deskQueueTab === 'readLater'
+                  ? 'bg-[#22D3EE]/15 text-[#67E8F9] border border-[#22D3EE]/45'
+                  : 'text-[#8C96A8] hover:text-[#F5F7FA] border border-transparent'
+              }`}
+            >
+              <Bookmark className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Read Later ({readLaterSources.length})</span>
+            </button>
             {(
               [
-                { id: 'articles', label: 'Studio Desk' },
                 { id: 'briefing', label: 'Audio Briefing' },
                 { id: 'archive', label: `Archive (${archive.length})` },
               ] as const
@@ -3258,7 +3527,7 @@ export default function App() {
                   key={tab.id}
                   type="button"
                   onClick={() => setActiveView(tab.id)}
-                  className={`h-9 px-3.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                  className={`h-9 px-3.5 text-xs font-medium rounded-md tabular-nums whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                     active
                       ? 'bg-[#22D3EE]/15 text-[#67E8F9] border border-[#22D3EE]/45'
                       : 'text-[#8C96A8] hover:text-[#F5F7FA] border border-transparent'
@@ -3355,6 +3624,8 @@ export default function App() {
             isTagging={isTagging}
             isRefreshingArticles={isRefreshingArticles}
             refreshArticlesStatus={refreshArticlesStatus}
+            queueTab={deskQueueTab}
+            onQueueTabChange={setDeskQueueTab}
             mobileOpen={mobileSourcesOpen}
             onCloseMobile={() => setMobileSourcesOpen(false)}
             onOpenAddModal={handleOpenAddModal}
@@ -3382,10 +3653,15 @@ export default function App() {
               <ArticleDeskView
                 articles={activeSources}
                 readLaterArticles={readLaterSources}
+                queueTab={deskQueueTab}
+                onQueueTabChange={setDeskQueueTab}
                 preferences={preferences}
                 onPreferencesChange={handlePreferencesChange}
                 onOpenAddModal={handleOpenAddModal}
                 onInspectSource={handleInspectSource}
+                onInspectHighlight={handleInspectHighlight}
+                onAddHighlight={handleAddArticleHighlight}
+                onRemoveHighlight={handleRemoveArticleHighlight}
                 onToggleArticle={handleToggleArticle}
                 onToggleAll={handleToggleAll}
                 onBulkToggleCategory={handleBulkToggleCategory}
@@ -3398,6 +3674,12 @@ export default function App() {
                 refreshArticlesStatus={refreshArticlesStatus}
                 refreshArticlesError={refreshArticlesError}
                 onDismissRefreshError={() => setRefreshArticlesError(null)}
+                onGenerateHighlightsSummary={handleGenerateHighlightsSummary}
+                isGeneratingHighlightsSummary={isGeneratingHighlightsSummary}
+                hasSavedHighlightsSummary={Boolean(highlightsMetaSummary)}
+                onOpenSavedHighlightsSummary={() =>
+                  setHighlightsSummaryModalOpen(true)
+                }
                 onBuildBriefing={handleBuildBriefing}
                 isGenerating={isGenerating || isSynthesizingAll}
                 generationStatus={generationStatus}
@@ -3597,6 +3879,40 @@ export default function App() {
         sources={articles}
         onClose={() => setInspectedTarget(null)}
         onToggleReadLater={handleToggleReadLater}
+        onRemoveHighlight={handleRemoveArticleHighlight}
+        onSelectHighlightPassage={handleInspectHighlight}
+      />
+
+      {/* Cross-Article Highlights Meta-Briefing Summary Modal */}
+      <HighlightsSummaryModal
+        open={highlightsSummaryModalOpen}
+        summary={highlightsMetaSummary}
+        isLoading={isGeneratingHighlightsSummary}
+        errorMessage={highlightsSummaryError}
+        scope={highlightsSummaryScope}
+        selectedStats={{
+          sourceCount: activeSources.filter(
+            (a) => a.selected && (a.highlights?.length ?? 0) > 0
+          ).length,
+          highlightCount: activeSources
+            .filter((a) => a.selected)
+            .reduce((sum, a) => sum + (a.highlights?.length ?? 0), 0),
+        }}
+        allStats={{
+          sourceCount: articles.filter((a) => (a.highlights?.length ?? 0) > 0)
+            .length,
+          highlightCount: articles.reduce(
+            (sum, a) => sum + (a.highlights?.length ?? 0),
+            0
+          ),
+        }}
+        onScopeChange={setHighlightsSummaryScope}
+        onRegenerate={(scopeOverride) => {
+          void handleGenerateHighlightsSummary(scopeOverride);
+        }}
+        onSelectCitation={handleSelectCitation}
+        onSaveAsNotebookSource={handleSaveHighlightsSummaryAsSource}
+        onClose={() => setHighlightsSummaryModalOpen(false)}
       />
 
       {/* Add Source Modal (Upload PDF/DOCX/TXT/MD, Google Drive, Article URL, or Paste Text) */}

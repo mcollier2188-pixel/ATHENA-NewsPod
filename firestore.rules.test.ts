@@ -591,6 +591,14 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
   assert.match(rulesText, /isValidWorkspaceLink\(incoming\(\), docId\)/);
   assert.match(rulesText, /isWorkspaceLinkOwnerUpdateAction\(\)/);
 
+  interface HighlightPayload {
+    id: string;
+    text: string;
+    passageIndex: number;
+    createdAt: string;
+    [extraKey: string]: unknown;
+  }
+
   interface SourcePayload {
     docId: string;
     sourceId: string;
@@ -604,6 +612,7 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     url: string;
     summary: string;
     keyFacts: string[];
+    highlights?: HighlightPayload[];
     content: string;
     estimatedReadMinutes: number;
     selected: boolean;
@@ -619,7 +628,7 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     [extraKey: string]: unknown;
   }
 
-  const SOURCE_KEYS = new Set([
+  const REQUIRED_SOURCE_KEYS = [
     'docId',
     'sourceId',
     'ownerId',
@@ -644,11 +653,41 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     'addedAt',
     'createdAt',
     'updatedAt',
-  ]);
+  ];
+
+  const ALLOWED_SOURCE_KEYS = new Set([...REQUIRED_SOURCE_KEYS, 'highlights']);
+  const HIGHLIGHT_KEYS = new Set(['id', 'text', 'passageIndex', 'createdAt']);
+
+  const isValidHighlightItem = (h: HighlightPayload): boolean => {
+    const keys = Object.keys(h);
+    if (keys.length !== HIGHLIGHT_KEYS.size || !keys.every((k) => HIGHLIGHT_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      isValidId(h.id) &&
+      typeof h.text === 'string' &&
+      h.text.length >= 2 &&
+      h.text.length <= 600 &&
+      typeof h.passageIndex === 'number' &&
+      h.passageIndex >= 0 &&
+      h.passageIndex <= 999 &&
+      typeof h.createdAt === 'string' &&
+      h.createdAt.length >= 1 &&
+      h.createdAt.length <= 64
+    );
+  };
+
+  const isValidHighlightList = (listVal: unknown): boolean => {
+    if (!Array.isArray(listVal) || listVal.length > 20) return false;
+    return listVal.length === 0 || isValidHighlightItem(listVal[0] as HighlightPayload);
+  };
 
   const isValidSource = (auth: AuthToken, data: SourcePayload, docId: string): boolean => {
     const keys = Object.keys(data);
-    if (keys.length !== SOURCE_KEYS.size || !keys.every((k) => SOURCE_KEYS.has(k))) {
+    if (
+      !REQUIRED_SOURCE_KEYS.every((k) => keys.includes(k)) ||
+      !keys.every((k) => ALLOWED_SOURCE_KEYS.has(k))
+    ) {
       return false;
     }
     return (
@@ -672,6 +711,7 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
       data.summary.length <= 2000 &&
       Array.isArray(data.keyFacts) &&
       data.keyFacts.length <= 12 &&
+      (!('highlights' in data) || isValidHighlightList(data.highlights)) &&
       data.content.length <= 30000 &&
       data.estimatedReadMinutes >= 1 &&
       data.estimatedReadMinutes <= 240 &&
@@ -745,8 +785,24 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     updatedAt: REQ_TIME,
   };
 
-  // Positive owner create succeeds
+  assert.match(rulesText, /isValidHighlightList\(data\.highlights\)/);
+
+  // Positive owner create succeeds (both without highlights for legacy compat and with highlights)
   assert.equal(evaluateSourceCreate(aliceAuth, validDocId, baseSource), true);
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      highlights: [
+        {
+          id: 'hl_margin_target',
+          text: 'Target margin +420 bps across core enterprise tiers',
+          passageIndex: 1,
+          createdAt: '2026-11-21T20:05:00.000Z',
+        },
+      ],
+    }),
+    true
+  );
   // Cross-user ownerId spoofing denied
   assert.equal(
     evaluateSourceCreate(aliceAuth, validDocId, { ...baseSource, ownerId: 'uid_bob' }),
@@ -768,7 +824,49 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     }),
     false
   );
-  // Immutable sourceId / createdAt tampering on update is PERMISSION_DENIED
+  // Highlight Red Team checks: > 20 items, oversized phrase (> 600 chars), or shadow field in highlight map -> PERMISSION_DENIED
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      highlights: Array.from({ length: 21 }, (_, idx) => ({
+        id: `hl_${idx}`,
+        text: 'Valid phrase',
+        passageIndex: 1,
+        createdAt: '2026-11-21T20:05:00.000Z',
+      })),
+    }),
+    false
+  );
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      highlights: [
+        {
+          id: 'hl_oversized',
+          text: 'x'.repeat(601),
+          passageIndex: 1,
+          createdAt: '2026-11-21T20:05:00.000Z',
+        },
+      ],
+    }),
+    false
+  );
+  assert.equal(
+    evaluateSourceCreate(aliceAuth, validDocId, {
+      ...baseSource,
+      highlights: [
+        {
+          id: 'hl_shadow',
+          text: 'Valid phrase',
+          passageIndex: 1,
+          createdAt: '2026-11-21T20:05:00.000Z',
+          isAdmin: true,
+        },
+      ],
+    }),
+    false
+  );
+  // Immutable sourceId / createdAt tampering on update is PERMISSION_DENIED, while owner highlight update succeeds
   const existingSource = {
     ...baseSource,
     createdAt: REQ_TIME - 5000,
@@ -778,6 +876,14 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
     evaluateSourceUpdate(aliceAuth, validDocId, existingSource, {
       ...existingSource,
       selected: false,
+      highlights: [
+        {
+          id: 'hl_1',
+          text: 'Full structured document text.',
+          passageIndex: 1,
+          createdAt: '2026-11-21T20:06:00.000Z',
+        },
+      ],
       updatedAt: REQ_TIME,
     }),
     true

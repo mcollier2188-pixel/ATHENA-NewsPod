@@ -585,6 +585,10 @@
           "type": "array",
           "description": "Bounded list (max 12) of extracted key facts (each <= 300 chars)."
         },
+        "highlights": {
+          "type": "array",
+          "description": "Bounded list (max 20) of user-highlighted snippet phrases ({ id, text, passageIndex, createdAt }, text <= 600 chars) saved for reference during briefing generation."
+        },
         "content": {
           "type": "string",
           "minLength": 0,
