@@ -211,7 +211,7 @@ export function AiDeskView({
 
   // ---------- 1. Multi-Model Chat State (Multi-Thread) ----------
   const [selectedModel, setSelectedModel] =
-    useState<SuiteChatModelId>('gemini-3.5-flash-lite');
+    useState<SuiteChatModelId>('gemini-3.1-flash-lite');
   const [selectedPersonaId, setSelectedPersonaId] = useState<string>('Managing Editor');
   const [activeThreadId, setActiveThreadId] = useState<string>('default');
   const [threads, setThreads] = useState<DbChatThreadSummary[]>([]);

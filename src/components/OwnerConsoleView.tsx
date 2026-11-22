@@ -306,7 +306,7 @@ export function OwnerConsoleView({
     auditRetentionDays: 90 | 180 | 365;
   }>({
     defaultShareTtlHours: 72,
-    defaultChatModel: 'gemini-3.5-flash-lite',
+    defaultChatModel: 'gemini-3.1-flash-lite',
     adaptiveQualityDefault: true,
     requireVerifiedEmailForShares: true,
     auditRetentionDays: 180,

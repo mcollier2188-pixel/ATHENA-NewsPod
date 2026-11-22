@@ -132,15 +132,22 @@ export interface ShareGovernanceController {
 }
 
 const ALLOWED_CHAT_MODELS = new Set([
-  'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
   'gemini-4-hydrogen',
   'gemini-4-neon',
   'gemini-4-carbon',
 ]);
 
+function normalizeSuiteChatModel(rawModel?: string): string {
+  if (!rawModel || rawModel === 'gemini-3.5-flash-lite') {
+    return 'gemini-3.1-flash-lite';
+  }
+  return ALLOWED_CHAT_MODELS.has(rawModel) ? rawModel : 'gemini-3.1-flash-lite';
+}
+
 function buildChatFallbackModels(primaryModel: string): string[] {
-  const ordered = [primaryModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+  const normalized = normalizeSuiteChatModel(primaryModel);
+  const ordered = [normalized, 'gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-4-neon'];
   return Array.from(new Set(ordered));
 }
 
@@ -318,11 +325,11 @@ export function registerSuiteRoutes(
   formatApiError: (err: unknown) => { status: number; message: string },
   shareGovernance: ShareGovernanceController
 ) {
-  // 1. Multi-model Gemini Chatbot (default gemini-3.5-flash-lite with automatic fallback to gemini-3.1-flash-lite)
+  // 1. Multi-model Gemini Chatbot (default gemini-3.1-flash-lite with automatic fallback to gemini-4-hydrogen)
   app.post('/api/suite/chat', async (req: Request, res: Response) => {
     try {
       const {
-        model = 'gemini-3.5-flash-lite',
+        model = 'gemini-3.1-flash-lite',
         systemInstruction,
         messages,
       } = req.body as {
@@ -331,9 +338,7 @@ export function registerSuiteRoutes(
         messages?: Array<{ role: 'user' | 'model'; text: string }>;
       };
 
-      const selectedModel = ALLOWED_CHAT_MODELS.has(model)
-        ? model
-        : 'gemini-3.5-flash-lite';
+      const selectedModel = normalizeSuiteChatModel(model);
 
       if (!Array.isArray(messages) || messages.length === 0) {
         res.status(400).json({ error: 'Provide at least one message to chat.' });
@@ -962,7 +967,7 @@ export function registerSuiteRoutes(
       const {
         threadId = 'default',
         role,
-        modelId = 'gemini-3.5-flash-lite',
+        modelId = 'gemini-3.1-flash-lite',
         persona = 'Managing Editor',
         content,
       } = req.body as {

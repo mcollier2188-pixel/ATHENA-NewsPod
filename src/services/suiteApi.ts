@@ -1,5 +1,4 @@
 export type SuiteChatModelId =
-  | 'gemini-3.5-flash-lite'
   | 'gemini-3.1-flash-lite'
   | 'gemini-4-hydrogen'
   | 'gemini-4-neon'
@@ -14,16 +13,10 @@ export interface SuiteChatModelOption {
 
 export const SUITE_CHAT_MODELS: SuiteChatModelOption[] = [
   {
-    id: 'gemini-3.5-flash-lite',
-    label: 'Gemini 3.5 Flash-Lite',
-    tier: 'Default · High Limit',
-    description: 'Fast, high-quota default for everyday research, briefings, and structured chat.',
-  },
-  {
     id: 'gemini-3.1-flash-lite',
     label: 'Gemini 3.1 Flash-Lite',
-    tier: 'Ultra Fast',
-    description: 'Instant iterations, quick rewrites, and low-latency fallback Q&A.',
+    tier: 'Default · High Limit',
+    description: 'Fast, high-quota default for everyday research, briefings, and structured chat.',
   },
   {
     id: 'gemini-4-hydrogen',

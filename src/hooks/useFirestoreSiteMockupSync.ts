@@ -3,6 +3,8 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
+  getDocs,
   onSnapshot,
   query,
   serverTimestamp,
@@ -663,7 +665,6 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
   const [syncStatus, setSyncStatus] = useState<FirestoreSyncStatus>('local');
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [fatalFirestoreError, setFatalFirestoreError] = useState<Error | null>(null);
 
   // Refs for bidirectional echo-free synchronization
   const latestProjectRef = useRef<SiteMockupProject>(project);
@@ -684,11 +685,6 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
 
   const mockupId = user ? `mockup_${sanitizeId(user.uid, 'user')}` : null;
   const firestoreDocPath = mockupId ? `siteMockups/${mockupId}` : null;
-
-  // Throw fatal structured Firestore errors into ErrorBoundary cleanly
-  if (fatalFirestoreError) {
-    throw fatalFirestoreError;
-  }
 
   // Always mirror state into localStorage for instant reloads & guest offline safety
   useEffect(() => {
@@ -716,21 +712,69 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
       setSyncStatus('syncing');
       setSyncError(null);
 
-      const nextRevision = remoteDocExistsRef.current
-        ? remoteRevisionRef.current + 1
-        : 1;
-      const { mockupDoc, mediaDocs } = buildSanitizedFirestorePayloads(
-        targetProject,
-        user.uid,
-        mockupId,
-        nextRevision
-      );
-
       const parentRef = doc(db, 'siteMockups', mockupId);
       const mediaColPath = `${firestoreDocPath}/mediaAssets`;
+      const mediaQuery = query(
+        collection(db, 'siteMockups', mockupId, 'mediaAssets'),
+        where('ownerId', '==', user.uid),
+        where('mockupId', '==', mockupId)
+      );
+
+      let parentExists = remoteDocExistsRef.current;
 
       try {
-        if (!remoteDocExistsRef.current) {
+        // Read live parent state so revision and create-vs-update always match Firestore security rules
+        let serverRevision = remoteRevisionRef.current;
+        try {
+          const latestParentSnap = await getDoc(parentRef);
+          parentExists = latestParentSnap.exists();
+          if (parentExists) {
+            const parentData = latestParentSnap.data() as FirestoreSiteMockupDoc;
+            serverRevision = Math.max(serverRevision, Number(parentData.revision || 1));
+          } else {
+            serverRevision = 0;
+          }
+        } catch (readErr) {
+          try {
+            handleFirestoreError(readErr, OperationType.GET, firestoreDocPath);
+          } catch {
+            // Structured diagnostics logged; rethrow original to surface sync status cleanly
+          }
+          throw readErr;
+        }
+
+        const nextRevision = parentExists ? serverRevision + 1 : 1;
+        const { mockupDoc, mediaDocs } = buildSanitizedFirestorePayloads(
+          targetProject,
+          user.uid,
+          mockupId,
+          nextRevision
+        );
+
+        // Fetch live mediaAssets subcollection IDs so existing assets use updateDoc (preserving createdAt)
+        const existingMediaMap: Record<string, string> = {
+          ...remoteMediaStateRef.current,
+        };
+        if (parentExists) {
+          try {
+            const existingMediaSnap = await getDocs(mediaQuery);
+            const liveMap: Record<string, string> = {};
+            existingMediaSnap.forEach((docSnap) => {
+              const d = docSnap.data() as FirestoreMediaAssetDoc;
+              const idKey = d.assetId || docSnap.id;
+              liveMap[idKey] = `${d.label}|${d.category}|${d.slotKey}|${(d.dataUrl || '').length}|${d.addedAt}`;
+            });
+            Object.assign(existingMediaMap, liveMap);
+          } catch (listErr) {
+            try {
+              handleFirestoreError(listErr, OperationType.LIST, mediaColPath);
+            } catch {
+              // Structured diagnostics logged; continue with cached remoteMediaStateRef
+            }
+          }
+        }
+
+        if (!parentExists) {
           // Atomic create of parent workspace + initial media asset documents
           const batch = writeBatch(db);
           batch.set(parentRef, {
@@ -762,18 +806,19 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
             ...mutableFields,
             updatedAt: serverTimestamp(),
           });
+          remoteDocExistsRef.current = true;
           remoteRevisionRef.current = nextRevision;
 
           // Diff media assets subcollection: create new, update changed, delete removed
           const desiredIds = new Set<string>();
           const nextMediaMap: Record<string, string> = {
-            ...remoteMediaStateRef.current,
+            ...existingMediaMap,
           };
 
           for (const asset of mediaDocs) {
             desiredIds.add(asset.assetId);
             const sig = `${asset.label}|${asset.category}|${asset.slotKey}|${asset.dataUrl.length}|${asset.addedAt}`;
-            const existingSig = remoteMediaStateRef.current[asset.assetId];
+            const existingSig = existingMediaMap[asset.assetId];
             const assetRef = doc(db, 'siteMockups', mockupId, 'mediaAssets', asset.assetId);
 
             if (!existingSig) {
@@ -785,11 +830,27 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
                 });
                 nextMediaMap[asset.assetId] = sig;
               } catch (err) {
-                handleFirestoreError(
-                  err,
-                  OperationType.CREATE,
-                  `${mediaColPath}/${asset.assetId}`
-                );
+                try {
+                  handleFirestoreError(
+                    err,
+                    OperationType.CREATE,
+                    `${mediaColPath}/${asset.assetId}`
+                  );
+                } catch {
+                  // Logged structured FirestoreErrorInfo; fallback to updateDoc if asset already existed
+                }
+                await updateDoc(assetRef, {
+                  label: asset.label,
+                  category: asset.category,
+                  slotKey: asset.slotKey,
+                  dataUrl: asset.dataUrl,
+                  width: asset.width,
+                  height: asset.height,
+                  sizeKb: asset.sizeKb,
+                  addedAt: asset.addedAt,
+                  updatedAt: serverTimestamp(),
+                });
+                nextMediaMap[asset.assetId] = sig;
               }
             } else if (existingSig !== sig) {
               try {
@@ -815,7 +876,7 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
             }
           }
 
-          for (const existingId of Object.keys(remoteMediaStateRef.current)) {
+          for (const existingId of Object.keys(existingMediaMap)) {
             if (!desiredIds.has(existingId)) {
               const assetRef = doc(db, 'siteMockups', mockupId, 'mediaAssets', existingId);
               try {
@@ -840,19 +901,22 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setSyncStatus('error');
-        setSyncError('Could not sync mockup to Firestore.');
+        setSyncError(
+          /quota/i.test(msg)
+            ? 'Cloud sync paused (Firestore daily quota reached) — all edits are saved locally.'
+            : 'Cloud sync paused — all edits are saved locally. Click Retry Sync when ready.'
+        );
         if (/permission|insufficient/i.test(msg)) {
           try {
             handleFirestoreError(
               err,
-              remoteDocExistsRef.current ? OperationType.UPDATE : OperationType.CREATE,
+              parentExists ? OperationType.UPDATE : OperationType.CREATE,
               firestoreDocPath
             );
-          } catch (structuredErr) {
-            setFatalFirestoreError(structuredErr as Error);
+          } catch {
+            // Structured FirestoreErrorInfo logged to console; keep workspace interactive
           }
         } else {
-          // Still log structured Firestore diagnostics for non-permission failures
           console.error('SiteMockup Firestore sync failed:', msg);
         }
       } finally {
@@ -970,11 +1034,11 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
       },
       (error) => {
         setSyncStatus('error');
-        setSyncError('Firestore workspace subscription failed.');
+        setSyncError('Cloud workspace sync paused — local autosave remains active.');
         try {
           handleFirestoreError(error, OperationType.GET, firestoreDocPath);
-        } catch (structuredErr) {
-          setFatalFirestoreError(structuredErr as Error);
+        } catch {
+          // Structured FirestoreErrorInfo logged to console; keep workspace interactive
         }
       }
     );
@@ -996,11 +1060,11 @@ export function useFirestoreSiteMockupSync(): UseFirestoreSiteMockupSyncResult {
       },
       (error) => {
         setSyncStatus('error');
-        setSyncError('Firestore media assets subscription failed.');
+        setSyncError('Cloud media sync paused — local autosave remains active.');
         try {
           handleFirestoreError(error, OperationType.LIST, mediaColPath);
-        } catch (structuredErr) {
-          setFatalFirestoreError(structuredErr as Error);
+        } catch {
+          // Structured FirestoreErrorInfo logged to console; keep workspace interactive
         }
       }
     );

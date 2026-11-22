@@ -1124,6 +1124,16 @@ export function SiteMockupView({
         user ? nextCloudVer : snapshots.length + 1
       }`;
 
+    const saveLocalFallbackSnapshot = () => {
+      const snap: MockupSnapshot = {
+        id: `snap-${Date.now()}`,
+        label: resolvedLabel,
+        savedAt: new Date().toISOString(),
+        project: cloned,
+      };
+      setSnapshots((prev) => [snap, ...prev].slice(0, 15));
+    };
+
     if (user) {
       setIsSavingCloudMockup(true);
       try {
@@ -1149,8 +1159,11 @@ export function SiteMockupView({
         const { projectJson: _omitted, ...summary } = saved;
         setCloudMockups((prev) => [summary, ...prev]);
       } catch (err) {
+        saveLocalFallbackSnapshot();
         setCloudMockupError(
-          err instanceof Error ? err.message : 'Could not save mockup iteration.'
+          `${
+            err instanceof Error ? err.message : 'Cloud database unavailable.'
+          } Saved "${resolvedLabel}" to Session Drafts so nothing is lost.`
         );
       } finally {
         setIsSavingCloudMockup(false);
@@ -1158,13 +1171,7 @@ export function SiteMockupView({
       return;
     }
 
-    const snap: MockupSnapshot = {
-      id: `snap-${Date.now()}`,
-      label: resolvedLabel,
-      savedAt: new Date().toISOString(),
-      project: cloned,
-    };
-    setSnapshots((prev) => [snap, ...prev].slice(0, 15));
+    saveLocalFallbackSnapshot();
   }
 
   async function handleRevertCloudVersion(row: DbSavedMockupSummary) {
@@ -1858,9 +1865,9 @@ export function SiteMockupView({
             >
               <History className="w-3.5 h-3.5" aria-hidden="true" />
               Version History
-              {(user ? cloudMockups.length : snapshots.length) > 0 && (
+              {(user ? cloudMockups.length + snapshots.length : snapshots.length) > 0 && (
                 <span className="font-mono text-[11px] tabular-nums text-[#67E8F9]">
-                  ({user ? cloudMockups.length : snapshots.length})
+                  ({user ? cloudMockups.length + snapshots.length : snapshots.length})
                 </span>
               )}
             </button>

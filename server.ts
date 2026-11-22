@@ -44,8 +44,9 @@ const isProd =
   (!IS_DEV_SCRIPT && process.env.NODE_ENV !== 'development' && HAS_BUILT_CLIENT);
 
 const TEXT_MODEL_FALLBACK_CHAIN = [
-  'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
+  'gemini-4-hydrogen',
+  'gemini-4-neon',
 ] as const;
 
 const TTS_MODEL_FALLBACK_CHAIN = [
@@ -138,6 +139,16 @@ function withTextModelFallback<T>(fn: (model: string) => Promise<T>): Promise<T>
 
 function withTtsModelFallback<T>(fn: (model: string) => Promise<T>): Promise<T> {
   return withModelFallback(TTS_MODEL_FALLBACK_CHAIN, fn, 1);
+}
+
+function isKeyOrAuthGeminiError(err: unknown): boolean {
+  const raw = err instanceof Error ? err.message : String(err);
+  return (
+    raw.includes('GEMINI_API_KEY is not configured') ||
+    raw.includes('API_KEY_INVALID') ||
+    raw.includes('PERMISSION_DENIED') ||
+    raw.includes('403')
+  );
 }
 
 function formatApiError(err: unknown): { status: number; message: string } {
@@ -2814,20 +2825,107 @@ function sanitizeBrandSwatches(
     }
   }
 
-  for (const hex of fallbackHexes) {
+  const paddedFallbacks = [
+    ...fallbackHexes,
+    '#0F172A',
+    '#F8FAFC',
+    '#334155',
+    '#E2E8F0',
+  ];
+  for (const hex of paddedFallbacks) {
     if (result.length >= 6) break;
     if (!seen.has(hex)) {
       seen.add(hex);
       result.push({
         hex,
-        name: `Site Swatch ${result.length + 1}`,
-        role: 'surface',
-        usageNote: 'Sampled from website stylesheets',
+        name: describeHexSwatchName(hex, result.length),
+        role: result.length < 4 ? 'surface' : 'neutral',
+        usageNote: 'Supporting surface & typographic contrast tone',
       });
     }
   }
 
   return result.slice(0, 6);
+}
+
+function deriveBrandNameFromUrlOrTitle(parsedUrl: URL | null, pageTitle: string): string {
+  const cleanedTitle = pageTitle
+    .split(/\s*[|\-–—·•]\s*/)[0]
+    .replace(/\b(Home|Welcome to|Official Website)\b/gi, '')
+    .trim();
+  if (cleanedTitle.length >= 2) return cleanedTitle.slice(0, 64);
+  if (!parsedUrl) return 'Client Business';
+  const host = parsedUrl.hostname.replace(/^www\./i, '').split('.')[0] || 'Client Business';
+  return host
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function describeHexSwatchName(hex: string, index: number): string {
+  const clean = hex.replace('#', '');
+  const r = parseInt(clean.slice(0, 2), 16) || 0;
+  const g = parseInt(clean.slice(2, 4), 16) || 0;
+  const b = parseInt(clean.slice(4, 6), 16) || 0;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+  if (max - min < 18) {
+    if (lum < 0.2) return 'Carbon Slate';
+    if (lum < 0.45) return 'Graphite Stone';
+    if (lum < 0.78) return 'Warm Concrete';
+    return 'Chalk Surface';
+  }
+  if (r >= g && r >= b) {
+    return g > b + 28 ? 'Signal Amber' : 'Brick Crimson';
+  }
+  if (g >= r && g >= b) {
+    return b > r + 25 ? 'Harbour Teal' : 'Field Sage';
+  }
+  return r > g + 25 ? 'Royal Indigo' : lum < 0.35 ? 'Deep Harbour Navy' : 'Cobalt Steel';
+}
+
+function buildLocalColorExtractionFallback(
+  parsedUrl: URL,
+  pageTitle: string,
+  signals: RawSiteColorSignals
+): Record<string, unknown> {
+  const primary = signals.themeColor || signals.rankedHexColors[0] || '#1E3A5F';
+  const accent =
+    signals.rankedHexColors.find((h) => h !== primary && !isFlatNeutralGray(h)) ||
+    signals.rankedHexColors.find((h) => h !== primary) ||
+    '#D97706';
+  const candidatePool = Array.from(
+    new Set([
+      primary,
+      accent,
+      ...signals.rankedHexColors,
+      '#0F172A',
+      '#F8FAFC',
+      '#334155',
+      '#E2E8F0',
+    ])
+  ).slice(0, 6);
+
+  return {
+    brandName: deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle),
+    suggestedPrimary: primary,
+    suggestedAccent: accent,
+    suggestedCanvasMode: 'light',
+    swatches: candidatePool.map((hex, idx) => ({
+      hex,
+      name: describeHexSwatchName(hex, idx),
+      role: idx === 0 ? 'primary' : idx === 1 ? 'accent' : idx < 4 ? 'surface' : 'neutral',
+      usageNote:
+        idx === 0
+          ? 'Detected primary anchor colour from site styles'
+          : idx === 1
+            ? 'High-contrast call-to-action & highlight tone'
+            : 'Supporting surface & typographic tone from stylesheet',
+    })),
+  };
 }
 
 app.post('/api/mockup/extract-colors', async (req, res) => {
@@ -2881,7 +2979,7 @@ app.post('/api/mockup/extract-colors', async (req, res) => {
         fetchSucceeded = true;
       }
     } catch {
-      // Fallback to Google Search grounding below if site blocks server fetches
+      // Fallback to Google Search grounding or stylesheet defaults below if site blocks server fetches
     }
 
     const ai = getGeminiClient();
@@ -2912,48 +3010,56 @@ app.post('/api/mockup/extract-colors', async (req, res) => {
     let parsed: Record<string, unknown>;
     let usedFallback = false;
 
-    if (fetchSucceeded && (signals.rankedHexColors.length > 0 || pageExcerpt.length > 100)) {
-      const prompt = [
-        `TARGET WEBSITE URL: ${parsedUrl.toString()}`,
-        pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
-        signals.themeColor ? `META THEME-COLOR: ${signals.themeColor}` : '',
-        signals.cssVariables.length > 0
-          ? `CSS CUSTOM PROPERTIES FOUND:\n${signals.cssVariables.join('\n')}`
-          : '',
-        signals.rankedHexColors.length > 0
-          ? `TOP DETECTED HEX COLOURS (FREQUENCY RANKED): ${signals.rankedHexColors.join(', ')}`
-          : '',
-        pageExcerpt ? `PAGE CONTEXT EXCERPT:\n${pageExcerpt}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
+    try {
+      if (fetchSucceeded && (signals.rankedHexColors.length > 0 || pageExcerpt.length > 100)) {
+        const prompt = [
+          `TARGET WEBSITE URL: ${parsedUrl.toString()}`,
+          pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
+          signals.themeColor ? `META THEME-COLOR: ${signals.themeColor}` : '',
+          signals.cssVariables.length > 0
+            ? `CSS CUSTOM PROPERTIES FOUND:\n${signals.cssVariables.join('\n')}`
+            : '',
+          signals.rankedHexColors.length > 0
+            ? `TOP DETECTED HEX COLOURS (FREQUENCY RANKED): ${signals.rankedHexColors.join(', ')}`
+            : '',
+          pageExcerpt ? `PAGE CONTEXT EXCERPT:\n${pageExcerpt}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
 
-      const response = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Inspect the extracted stylesheet colour tokens and page context below and curate a 5 to 6 colour Brand Swatch Library representing this website's dominant brand identity.\n\n${prompt}`,
-          config: {
-            systemInstruction:
-              'You are a senior brand designer extracting a website’s real visual colour system. Prefer actual detected brand hex codes from the supplied CSS variables, theme-color, and stylesheet tokens over invented ones—filtering out boilerplate utility greys. Return 5 or 6 distinct 6-digit #RRGGBB swatches with concise, evocative colour names (2–3 words, e.g. "Deep Slate Navy", "Signal Amber"), role strictly one of "primary", "accent", "surface", or "neutral", and a crisp 6–12 word usageNote. Pick suggestedPrimary (strong anchor colour), suggestedAccent (high-contrast CTA colour), and suggestedCanvasMode ("light" or "dark").',
-            responseMimeType: 'application/json',
-            responseSchema: swatchSchema,
-          },
-        })
-      );
+        const response = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Inspect the extracted stylesheet colour tokens and page context below and curate a 5 to 6 colour Brand Swatch Library representing this website's dominant brand identity.\n\n${prompt}`,
+            config: {
+              systemInstruction:
+                'You are a senior brand designer extracting a website’s real visual colour system. Prefer actual detected brand hex codes from the supplied CSS variables, theme-color, and stylesheet tokens over invented ones—filtering out boilerplate utility greys. Return 5 or 6 distinct 6-digit #RRGGBB swatches with concise, evocative colour names (2–3 words, e.g. "Deep Slate Navy", "Signal Amber"), role strictly one of "primary", "accent", "surface", or "neutral", and a crisp 6–12 word usageNote. Pick suggestedPrimary (strong anchor colour), suggestedAccent (high-contrast CTA colour), and suggestedCanvasMode ("light" or "dark").',
+              responseMimeType: 'application/json',
+              responseSchema: swatchSchema,
+            },
+          })
+        );
 
-      parsed = JSON.parse((response.text ?? '{}').trim());
-    } else {
+        parsed = JSON.parse((response.text ?? '{}').trim());
+      } else {
+        usedFallback = true;
+        const searchResp = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Look up the real brand and website at ${parsedUrl.toString()} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string), suggestedPrimary (6-digit #RRGGBB), suggestedAccent (6-digit #RRGGBB), suggestedCanvasMode ("light" or "dark"), and swatches (array of 5 to 6 objects each with hex #RRGGBB, name, role one of "primary"|"accent"|"surface"|"neutral", and short usageNote). Use the business's authentic brand colours and industry palette.`,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          })
+        );
+        parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
+      }
+    } catch (geminiErr) {
+      if (isKeyOrAuthGeminiError(geminiErr)) {
+        throw geminiErr;
+      }
       usedFallback = true;
-      const searchResp = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Look up the real brand and website at ${parsedUrl.toString()} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string), suggestedPrimary (6-digit #RRGGBB), suggestedAccent (6-digit #RRGGBB), suggestedCanvasMode ("light" or "dark"), and swatches (array of 5 to 6 objects each with hex #RRGGBB, name, role one of "primary"|"accent"|"surface"|"neutral", and short usageNote). Use the business's authentic brand colours and industry palette.`,
-          config: {
-            tools: [{ googleSearch: {} }],
-          },
-        })
-      );
-      parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
+      parsed = buildLocalColorExtractionFallback(parsedUrl, pageTitle, signals);
     }
 
     const suggestedPrimary = sanitizeHexColor(
@@ -3055,6 +3161,82 @@ function extractSiteFontSignals(html: string): string[] {
   return Array.from(found).slice(0, 8);
 }
 
+function buildLocalFontPairingsFallback(
+  parsedUrl: URL,
+  pageTitle: string,
+  brandName: string | undefined,
+  detectedSiteFonts: string[]
+): Record<string, unknown> {
+  const detectedPrimary = detectedSiteFonts[0] || '';
+  const detectedSecondary = detectedSiteFonts[1] || 'DM Sans';
+  const resolvedBrand =
+    (brandName || '').trim() || deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle);
+
+  const pairings = [
+    detectedPrimary
+      ? {
+          name: 'Site Match Upgrade',
+          headingFont: detectedPrimary,
+          bodyFont: detectedSecondary !== detectedPrimary ? detectedSecondary : 'DM Sans',
+          monoFont: 'IBM Plex Mono',
+          headingCategory: 'sans-serif',
+          bodyCategory: 'sans-serif',
+          mood: 'modern',
+          rationale: `Preserves ${detectedPrimary} from the live stylesheet paired with clean body legibility.`,
+          sourceNote: 'Detected in site CSS',
+        }
+      : {
+          name: 'Architectural Clarity',
+          headingFont: 'Plus Jakarta Sans',
+          bodyFont: 'DM Sans',
+          monoFont: 'IBM Plex Mono',
+          headingCategory: 'sans-serif',
+          bodyCategory: 'sans-serif',
+          mood: 'modern',
+          rationale: 'Crisp geometric headings paired with warm, effortless body copy for service clarity.',
+          sourceNote: 'Modern upgrade',
+        },
+    {
+      name: 'Precision Trade',
+      headingFont: 'Barlow',
+      bodyFont: 'IBM Plex Sans',
+      monoFont: 'IBM Plex Mono',
+      headingCategory: 'sans-serif',
+      bodyCategory: 'sans-serif',
+      mood: 'industrial',
+      rationale: 'Engineered, sturdy letterforms built for specialist contractors, specs, and project cards.',
+      sourceNote: 'Trade authority',
+    },
+    {
+      name: 'Contemporary Studio',
+      headingFont: 'Bricolage Grotesque',
+      bodyFont: 'Work Sans',
+      monoFont: 'JetBrains Mono',
+      headingCategory: 'display',
+      bodyCategory: 'sans-serif',
+      mood: 'modern',
+      rationale: 'Distinctive display character on hero headlines balanced by neutral, scannable body copy.',
+      sourceNote: 'High-impact hero',
+    },
+    {
+      name: 'Established Craft',
+      headingFont: 'Fraunces',
+      bodyFont: 'Source Sans 3',
+      monoFont: 'IBM Plex Mono',
+      headingCategory: 'serif',
+      bodyCategory: 'sans-serif',
+      mood: 'editorial',
+      rationale: 'Editorial authority that signals heritage, craftsmanship, and trusted local reputation.',
+      sourceNote: 'Editorial warmth',
+    },
+  ];
+
+  return {
+    brandName: resolvedBrand,
+    pairings,
+  };
+}
+
 app.post('/api/mockup/suggest-fonts', async (req, res) => {
   try {
     const { url, brandName, industry } = req.body as {
@@ -3106,7 +3288,7 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
         fetchSucceeded = true;
       }
     } catch {
-      // Fallback to Google Search grounding below if the site blocks server fetch
+      // Fallback to Google Search grounding or curated pairings below if the site blocks server fetch
     }
 
     const ai = getGeminiClient();
@@ -3151,50 +3333,66 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
     let parsed: Record<string, unknown>;
     let usedFallback = false;
 
-    if (fetchSucceeded && (detectedSiteFonts.length > 0 || pageExcerpt.length > 80)) {
-      const contextBlock = [
-        `TARGET WEBSITE URL: ${parsedUrl.toString()}`,
-        pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
-        brandName ? `CURRENT MOCKUP BRAND: ${brandName}` : '',
-        industry ? `CURRENT MOCKUP INDUSTRY: ${industry}` : '',
-        detectedSiteFonts.length > 0
-          ? `DETECTED FONT FAMILIES IN SITE HTML/CSS: ${detectedSiteFonts.join(', ')}`
-          : 'DETECTED FONT FAMILIES: None explicitly linked in HTML head.',
-        pageExcerpt ? `PAGE CONTENT EXCERPT:\n${pageExcerpt}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
+    try {
+      if (fetchSucceeded && (detectedSiteFonts.length > 0 || pageExcerpt.length > 80)) {
+        const contextBlock = [
+          `TARGET WEBSITE URL: ${parsedUrl.toString()}`,
+          pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
+          brandName ? `CURRENT MOCKUP BRAND: ${brandName}` : '',
+          industry ? `CURRENT MOCKUP INDUSTRY: ${industry}` : '',
+          detectedSiteFonts.length > 0
+            ? `DETECTED FONT FAMILIES IN SITE HTML/CSS: ${detectedSiteFonts.join(', ')}`
+            : 'DETECTED FONT FAMILIES: None explicitly linked in HTML head.',
+          pageExcerpt ? `PAGE CONTENT EXCERPT:\n${pageExcerpt}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
 
-      const response = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Recommend 4 distinct, production-grade Google Font pairings tailored to this website and business identity.\n\n${contextBlock}`,
-          config: {
-            systemInstruction: `You are a senior typographer and brand designer. ${allowedCatalogNote} Return exactly 4 distinct pairings with varied character (e.g., faithful/upgraded site match, clean modern, editorial/heritage, bold trade/display). If the website already uses a valid Google Font, include an upgraded pairing honoring it as the first option. For each pairing return: name (2–3 words), headingFont (exact Google Fonts family name), bodyFont (exact Google Fonts family name), monoFont (exact Google Fonts mono family name), headingCategory ("sans-serif" | "serif" | "display"), bodyCategory ("sans-serif" | "serif"), mood ("industrial" | "editorial" | "modern"), rationale (crisp 10–18 word explanation why it suits this business), and sourceNote (short 2–4 word origin label like "Matches site font" or "Modern upgrade").`,
-            responseMimeType: 'application/json',
-            responseSchema: fontPairingSchema,
-          },
-        })
-      );
+        const response = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Recommend 4 distinct, production-grade Google Font pairings tailored to this website and business identity.\n\n${contextBlock}`,
+            config: {
+              systemInstruction: `You are a senior typographer and brand designer. ${allowedCatalogNote} Return exactly 4 distinct pairings with varied character (e.g., faithful/upgraded site match, clean modern, editorial/heritage, bold trade/display). If the website already uses a valid Google Font, include an upgraded pairing honoring it as the first option. For each pairing return: name (2–3 words), headingFont (exact Google Fonts family name), bodyFont (exact Google Fonts family name), monoFont (exact Google Fonts mono family name), headingCategory ("sans-serif" | "serif" | "display"), bodyCategory ("sans-serif" | "serif"), mood ("industrial" | "editorial" | "modern"), rationale (crisp 10–18 word explanation why it suits this business), and sourceNote (short 2–4 word origin label like "Matches site font" or "Modern upgrade").`,
+              responseMimeType: 'application/json',
+              responseSchema: fontPairingSchema,
+            },
+          })
+        );
 
-      parsed = JSON.parse((response.text ?? '{}').trim());
-    } else {
+        parsed = JSON.parse((response.text ?? '{}').trim());
+      } else {
+        usedFallback = true;
+        const searchResp = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Look up the real business website at ${parsedUrl.toString()}${
+              brandName ? ` (${brandName})` : ''
+            } and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string) and pairings (array of 4 objects each with: name, headingFont, bodyFont, monoFont, headingCategory one of "sans-serif"|"serif"|"display", bodyCategory one of "sans-serif"|"serif", mood one of "industrial"|"editorial"|"modern", rationale, sourceNote). ${allowedCatalogNote}`,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          })
+        );
+        parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
+      }
+    } catch (geminiErr) {
+      if (isKeyOrAuthGeminiError(geminiErr)) {
+        throw geminiErr;
+      }
       usedFallback = true;
-      const searchResp = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Look up the real business website at ${parsedUrl.toString()}${
-            brandName ? ` (${brandName})` : ''
-          } and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brandName (string) and pairings (array of 4 objects each with: name, headingFont, bodyFont, monoFont, headingCategory one of "sans-serif"|"serif"|"display", bodyCategory one of "sans-serif"|"serif", mood one of "industrial"|"editorial"|"modern", rationale, sourceNote). ${allowedCatalogNote}`,
-          config: {
-            tools: [{ googleSearch: {} }],
-          },
-        })
+      parsed = buildLocalFontPairingsFallback(
+        parsedUrl,
+        pageTitle,
+        brandName,
+        detectedSiteFonts
       );
-      parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
     }
 
-    const rawPairings = Array.isArray(parsed.pairings) ? parsed.pairings : [];
+    const rawPairings = Array.isArray(parsed.pairings) && parsed.pairings.length > 0
+      ? parsed.pairings
+      : (buildLocalFontPairingsFallback(parsedUrl, pageTitle, brandName, detectedSiteFonts)
+          .pairings as unknown[]);
     const sanitizeFont = (val: unknown, fallback: string) => {
       const cleaned = String(val || '')
         .replace(/['"<>]/g, '')
@@ -3243,13 +3441,6 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
         };
       });
 
-    if (sanitizedPairings.length === 0) {
-      res.status(502).json({
-        error: 'Gemini returned no font pairings for that URL. Try again or check the URL.',
-      });
-      return;
-    }
-
     res.json({
       sourceUrl: parsedUrl.toString(),
       brandName: String(parsed.brandName || pageTitle || brandName || parsedUrl.hostname).trim(),
@@ -3262,6 +3453,179 @@ app.post('/api/mockup/suggest-fonts', async (req, res) => {
     res.status(status).json({ error: message });
   }
 });
+
+interface ScrapedHtmlStructure {
+  metaDescription: string;
+  h1: string;
+  headings: string[];
+  phone: string;
+  email: string;
+}
+
+function extractStructuredHtmlSignals(html: string): ScrapedHtmlStructure {
+  const metaMatch =
+    html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i) ||
+    html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i);
+  const metaDescription = metaMatch ? stripHtmlToText(metaMatch[1]).slice(0, 280) : '';
+
+  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const h1 = h1Match ? stripHtmlToText(h1Match[1]).slice(0, 140) : '';
+
+  const headings: string[] = [];
+  const headingRegex = /<h[23][^>]*>([\s\S]*?)<\/h[23]>/gi;
+  let hm: RegExpExecArray | null;
+  while ((hm = headingRegex.exec(html)) !== null && headings.length < 8) {
+    const txt = stripHtmlToText(hm[1]);
+    if (txt.length >= 4 && txt.length <= 72 && !headings.includes(txt)) {
+      headings.push(txt);
+    }
+  }
+
+  const telMatch = html.match(/href=["']tel:([^"']+)["']/i);
+  const phone = telMatch
+    ? decodeURIComponent(telMatch[1]).replace(/[^\d+\s()-]/g, '').trim().slice(0, 32)
+    : '';
+
+  const mailMatch = html.match(/href=["']mailto:([^"'?]+)["']/i);
+  const email = mailMatch ? decodeURIComponent(mailMatch[1]).trim().slice(0, 80) : '';
+
+  return { metaDescription, h1, headings, phone, email };
+}
+
+function buildLocalMockupAnalyzeFallback(args: {
+  normalizedUrl: string;
+  parsedUrl: URL | null;
+  pageTitle: string;
+  htmlSignals: ScrapedHtmlStructure;
+  extractedColors: string[];
+  fetchedText: string;
+  cleanedNotes: string;
+}): Record<string, unknown> {
+  const {
+    parsedUrl,
+    pageTitle,
+    htmlSignals,
+    extractedColors,
+    fetchedText,
+    cleanedNotes,
+  } = args;
+
+  const noteLines = cleanedNotes
+    .split(/\r?\n/)
+    .map((l) => l.replace(/^[-*•\d.)\s]+/, '').trim())
+    .filter((l) => l.length >= 3);
+
+  const brandName =
+    (pageTitle || (parsedUrl ? deriveBrandNameFromUrlOrTitle(parsedUrl, '') : '')) ||
+    (noteLines[0] ? noteLines[0].slice(0, 48) : 'Client Business');
+
+  const phoneFromNotes =
+    cleanedNotes.match(/(?:\+44|0)\s*\d[\d\s()-]{8,14}/)?.[0]?.trim() || '';
+  const emailFromNotes =
+    cleanedNotes.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.trim() || '';
+
+  const primaryHex = extractedColors[0] || '#1E3A5F';
+  const accentHex =
+    extractedColors.find((c) => c !== primaryHex && !isFlatNeutralGray(c)) ||
+    extractedColors[1] ||
+    '#D97706';
+
+  const rawServiceTitles =
+    htmlSignals.headings.length >= 2
+      ? htmlSignals.headings.slice(0, 4)
+      : noteLines.length >= 2
+        ? noteLines.slice(1, 5).map((l) => l.slice(0, 56))
+        : [
+            'Core Project Delivery',
+            'Site Surveys & Consultation',
+            'Maintenance & Upgrades',
+            'Dedicated Client Support',
+          ];
+
+  const subheadline =
+    htmlSignals.metaDescription ||
+    (cleanedNotes ? cleanedNotes.slice(0, 220) : '') ||
+    (fetchedText ? fetchedText.slice(0, 220) : '') ||
+    `${brandName} delivers dependable, straightforward workmanship with clear communication from quote to completion.`;
+
+  return {
+    brand: {
+      name: deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle || brandName),
+      industry: htmlSignals.headings[0]?.slice(0, 48) || 'Specialist Commercial & Local Services',
+      serviceArea: 'Local & Regional Coverage',
+      phone: htmlSignals.phone || phoneFromNotes,
+      email: htmlSignals.email || emailFromNotes,
+      hours: 'Mon–Fri 08:00–17:30',
+      address: '',
+      primaryHex,
+      accentHex,
+      canvasMode: 'light',
+      fontMood: 'modern',
+    },
+    brandSwatches: [
+      {
+        hex: primaryHex,
+        name: describeHexSwatchName(primaryHex, 0),
+        role: 'primary',
+        usageNote: 'Primary header & hero anchor colour',
+      },
+      {
+        hex: accentHex,
+        name: describeHexSwatchName(accentHex, 1),
+        role: 'accent',
+        usageNote: 'Call-to-action buttons & active highlights',
+      },
+    ],
+    hero: {
+      kicker: deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle || brandName),
+      headline:
+        htmlSignals.h1 ||
+        `${deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle || brandName)} — dependable work done properly.`,
+      subheadline,
+      primaryCta: 'Request a Quote',
+      secondaryCta: 'View Services',
+      trustHighlights: [
+        'Clear, itemised quotes',
+        'Experienced specialist team',
+        'Reliable scheduling & handover',
+      ],
+    },
+    services: rawServiceTitles.map((title) => ({
+      title: title.slice(0, 64),
+      description: `Tailored ${title.toLowerCase()} delivered cleanly on schedule with clear communication throughout.`,
+      deliverable: 'Written scope & schedule',
+    })),
+    projects: [
+      {
+        title: `Recent ${rawServiceTitles[0] || 'Client'} Instruction`,
+        location: 'Regional Site',
+        metric: 'Completed on schedule',
+        summary: 'Delivered to specification with full site tidy and client sign-off.',
+      },
+      {
+        title: `Commercial & Domestic Upgrade`,
+        location: 'Local Service Area',
+        metric: 'Repeat client instruction',
+        summary: 'Coordinated end-to-end from initial site survey through final handover.',
+      },
+    ],
+    about: {
+      heading: `Why clients choose ${deriveBrandNameFromUrlOrTitle(parsedUrl, pageTitle || brandName)}`,
+      story: subheadline,
+      credentials: [
+        'Fully insured workmanship',
+        'Direct point of contact from quote to completion',
+        'Straightforward written quotations',
+      ],
+    },
+    quoteForm: {
+      heading: 'Request a straightforward quote',
+      subtext: 'Share a few details about your job and we will come back to you promptly.',
+      submitLabel: 'Send Enquiry',
+    },
+  };
+}
 
 app.post('/api/mockup/analyze', async (req, res) => {
   try {
@@ -3278,10 +3642,18 @@ app.post('/api/mockup/analyze', async (req, res) => {
       normalizedUrl = `https://${normalizedUrl}`;
     }
 
+    let parsedUrlObj: URL | null = null;
     let fetchedText = '';
     let pageTitle = '';
     let extractedColors: string[] = [];
     let cssVariables: string[] = [];
+    let htmlSignals: ScrapedHtmlStructure = {
+      metaDescription: '',
+      h1: '',
+      headings: [],
+      phone: '',
+      email: '',
+    };
     let usedFallback = false;
 
     if (normalizedUrl) {
@@ -3290,6 +3662,7 @@ app.post('/api/mockup/analyze', async (req, res) => {
         if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
           throw new Error('Only http and https URLs are supported.');
         }
+        parsedUrlObj = parsedUrl;
 
         const resp = await fetch(parsedUrl.toString(), {
           headers: {
@@ -3304,6 +3677,7 @@ app.post('/api/mockup/analyze', async (req, res) => {
           const html = await resp.text();
           const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
           pageTitle = titleMatch ? stripHtmlToText(titleMatch[1]) : '';
+          htmlSignals = extractStructuredHtmlSignals(html);
           const signals = await collectSiteColorSignals(parsedUrl, html);
           extractedColors = signals.rankedHexColors.slice(0, 8);
           cssVariables = signals.cssVariables;
@@ -3410,47 +3784,63 @@ app.post('/api/mockup/analyze', async (req, res) => {
 
     let parsed: Record<string, unknown>;
 
-    if (fetchedText.length >= 160 || cleanedNotes.length > 0) {
-      const prompt = [
-        normalizedUrl ? `TARGET WEBSITE URL: ${normalizedUrl}` : '',
-        pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
-        cssVariables.length > 0 ? `CSS VARIABLES:\n${cssVariables.join('\n')}` : '',
-        extractedColors.length > 0
-          ? `HEX COLOURS DETECTED IN SITE STYLES: ${extractedColors.join(', ')}`
-          : '',
-        fetchedText ? `EXTRACTED LIVE PAGE CONTENT:\n${fetchedText}` : '',
-        cleanedNotes ? `USER NOTES / PASTED COPY:\n${cleanedNotes}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
+    try {
+      if (fetchedText.length >= 160 || cleanedNotes.length > 0) {
+        const prompt = [
+          normalizedUrl ? `TARGET WEBSITE URL: ${normalizedUrl}` : '',
+          pageTitle ? `PAGE TITLE: ${pageTitle}` : '',
+          cssVariables.length > 0 ? `CSS VARIABLES:\n${cssVariables.join('\n')}` : '',
+          extractedColors.length > 0
+            ? `HEX COLOURS DETECTED IN SITE STYLES: ${extractedColors.join(', ')}`
+            : '',
+          fetchedText ? `EXTRACTED LIVE PAGE CONTENT:\n${fetchedText}` : '',
+          cleanedNotes ? `USER NOTES / PASTED COPY:\n${cleanedNotes}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
 
-      const response = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Analyze the business information below and produce a clean, modern, conversion-focused website redesign mockup tailored to their exact industry and brand colours.\n\n${prompt}`,
-          config: {
-            systemInstruction:
-              'You are a senior web designer and copywriter creating a sharp, authentic redesign mockup for a real local or trade/commercial business. Extract real company name, phone, email, address, service area, and genuine services from the supplied content—never invent fake phone numbers or fake review quotes. Choose a strong primaryHex (6-digit #RRGGBB, leaning on detected brand colours when appropriate) and high-contrast accentHex (#RRGGBB). Also return 5 to 6 curated brandSwatches ({ hex, name, role: "primary"|"accent"|"surface"|"neutral", usageNote }). Set canvasMode to "light" or "dark" based on what best fits the industry, and fontMood to "industrial", "modern", or "editorial". Write crisp, plain-English copy with zero generic SaaS buzzwords ("elevate", "supercharge", "empower"). Provide 3 to 4 concrete services, 2 to 3 realistic project examples grounded in their work, and 3 authentic credentials.',
-            responseMimeType: 'application/json',
-            responseSchema: mockupSchema,
-          },
-        })
-      );
+        const response = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Analyze the business information below and produce a clean, modern, conversion-focused website redesign mockup tailored to their exact industry and brand colours.\n\n${prompt}`,
+            config: {
+              systemInstruction:
+                'You are a senior web designer and copywriter creating a sharp, authentic redesign mockup for a real local or trade/commercial business. Extract real company name, phone, email, address, service area, and genuine services from the supplied content—never invent fake phone numbers or fake review quotes. Choose a strong primaryHex (6-digit #RRGGBB, leaning on detected brand colours when appropriate) and high-contrast accentHex (#RRGGBB). Also return 5 to 6 curated brandSwatches ({ hex, name, role: "primary"|"accent"|"surface"|"neutral", usageNote }). Set canvasMode to "light" or "dark" based on what best fits the industry, and fontMood to "industrial", "modern", or "editorial". Write crisp, plain-English copy with zero generic SaaS buzzwords ("elevate", "supercharge", "empower"). Provide 3 to 4 concrete services, 2 to 3 realistic project examples grounded in their work, and 3 authentic credentials.',
+              responseMimeType: 'application/json',
+              responseSchema: mockupSchema,
+            },
+          })
+        );
 
-      parsed = JSON.parse((response.text ?? '{}').trim());
-    } else {
-      // Site blocked direct fetch (e.g. Cloudflare) — try Google Search grounding to gather real info
+        parsed = JSON.parse((response.text ?? '{}').trim());
+      } else {
+        // Site blocked direct fetch (e.g. Cloudflare) — try Google Search grounding to gather real info
+        usedFallback = true;
+        const searchResp = await withTextModelFallback((model) =>
+          ai.models.generateContent({
+            model,
+            contents: `Look up the real business website at ${normalizedUrl} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brand ({ name, industry, serviceArea, phone, email, hours, address, primaryHex, accentHex, canvasMode, fontMood }), brandSwatches ([{ hex, name, role, usageNote }]), hero ({ kicker, headline, subheadline, primaryCta, secondaryCta, trustHighlights }), services ([{ title, description, deliverable }]), projects ([{ title, location, metric, summary }]), about ({ heading, story, credentials }), quoteForm ({ heading, subtext, submitLabel }). Use authentic details for this business and a tailored 6-digit hex palette.`,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          })
+        );
+        parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
+      }
+    } catch (geminiErr) {
+      if (isKeyOrAuthGeminiError(geminiErr)) {
+        throw geminiErr;
+      }
       usedFallback = true;
-      const searchResp = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Look up the real business website at ${normalizedUrl} and return ONLY a single valid JSON object (no markdown outside JSON) with keys: brand ({ name, industry, serviceArea, phone, email, hours, address, primaryHex, accentHex, canvasMode, fontMood }), brandSwatches ([{ hex, name, role, usageNote }]), hero ({ kicker, headline, subheadline, primaryCta, secondaryCta, trustHighlights }), services ([{ title, description, deliverable }]), projects ([{ title, location, metric, summary }]), about ({ heading, story, credentials }), quoteForm ({ heading, subtext, submitLabel }). Use authentic details for this business and a tailored 6-digit hex palette.`,
-          config: {
-            tools: [{ googleSearch: {} }],
-          },
-        })
-      );
-      parsed = JSON.parse(extractJsonBlock(searchResp.text ?? '{}'));
+      parsed = buildLocalMockupAnalyzeFallback({
+        normalizedUrl,
+        parsedUrl: parsedUrlObj,
+        pageTitle,
+        htmlSignals,
+        extractedColors,
+        fetchedText,
+        cleanedNotes,
+      });
     }
 
     const rawBrand = (parsed.brand || {}) as Record<string, unknown>;
@@ -3552,6 +3942,81 @@ app.post('/api/mockup/analyze', async (req, res) => {
   }
 });
 
+function buildLocalSectionRewriteFallback(
+  section: 'hero' | 'services' | 'projects' | 'about',
+  currentData: unknown,
+  brandObj: Record<string, unknown>,
+  instruction: string
+): Record<string, unknown> {
+  const brandName = String(brandObj.name || 'Our team').trim();
+  const serviceArea = String(brandObj.serviceArea || 'your area').trim();
+  const wantsShorter = /short|punch|concise|tight/i.test(instruction);
+
+  if (section === 'hero') {
+    const h = (currentData || {}) as Record<string, unknown>;
+    const rawHead = String(h.headline || `${brandName} — dependable work delivered on schedule.`).trim();
+    const rawSub = String(
+      h.subheadline || `Clear quotes, tidy workmanship, and direct communication across ${serviceArea}.`
+    ).trim();
+    return {
+      hero: {
+        kicker: String(h.kicker || brandObj.industry || brandName).trim(),
+        headline: wantsShorter ? rawHead.split(/[.,;—–]/)[0].trim() + '.' : rawHead,
+        subheadline: wantsShorter ? rawSub.split(/(?<=[.!?])\s+/)[0] || rawSub : rawSub,
+        primaryCta: String(h.primaryCta || 'Get a Fast Quote').trim(),
+        secondaryCta: String(h.secondaryCta || 'View Services').trim(),
+        trustHighlights: Array.isArray(h.trustHighlights) && h.trustHighlights.length > 0
+          ? h.trustHighlights
+          : ['Fast written quotes', 'Fully insured team', 'On-schedule handover'],
+      },
+    };
+  }
+
+  if (section === 'services') {
+    const list = Array.isArray(currentData) ? currentData : [];
+    return {
+      services: list.map((item, idx) => {
+        const s = (item || {}) as Record<string, unknown>;
+        const desc = String(s.description || '').trim();
+        return {
+          id: String(s.id || `srv-${idx + 1}`),
+          title: String(s.title || `Service ${idx + 1}`).trim(),
+          description: wantsShorter ? (desc.split(/(?<=[.!?])\s+/)[0] || desc) : desc,
+          deliverable: String(s.deliverable || 'Clear scope & quote').trim(),
+        };
+      }),
+    };
+  }
+
+  if (section === 'projects') {
+    const list = Array.isArray(currentData) ? currentData : [];
+    return {
+      projects: list.map((item, idx) => {
+        const p = (item || {}) as Record<string, unknown>;
+        const summary = String(p.summary || '').trim();
+        return {
+          id: String(p.id || `prj-${idx + 1}`),
+          title: String(p.title || `Project ${idx + 1}`).trim(),
+          location: String(p.location || serviceArea).trim(),
+          metric: String(p.metric || 'Completed on schedule').trim(),
+          summary: wantsShorter ? (summary.split(/(?<=[.!?])\s+/)[0] || summary) : summary,
+          ...(p.photoDataUrl ? { photoDataUrl: p.photoDataUrl } : {}),
+        };
+      }),
+    };
+  }
+
+  const a = (currentData || {}) as Record<string, unknown>;
+  const story = String(a.story || '').trim();
+  return {
+    about: {
+      heading: String(a.heading || `Straightforward service from ${brandName}`).trim(),
+      story: wantsShorter ? (story.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ') || story) : story,
+      credentials: Array.isArray(a.credentials) ? a.credentials : [],
+    },
+  };
+}
+
 app.post('/api/mockup/rewrite', async (req, res) => {
   try {
     const { section, project, instruction } = req.body as {
@@ -3572,7 +4037,8 @@ app.post('/api/mockup/rewrite', async (req, res) => {
 
     const ai = getGeminiClient();
     const currentData = project[section];
-    const brandSummary = JSON.stringify(project.brand || {});
+    const brandObj = (project.brand || {}) as Record<string, unknown>;
+    const brandSummary = JSON.stringify(brandObj);
 
     const schemaBySection: Record<string, Record<string, unknown>> = {
       hero: {
@@ -3637,26 +4103,58 @@ app.post('/api/mockup/rewrite', async (req, res) => {
       },
     };
 
-    const response = await withTextModelFallback((model) =>
-      ai.models.generateContent({
-        model,
-        contents: `BUSINESS CONTEXT: ${brandSummary}\n\nCURRENT "${section.toUpperCase()}" SECTION:\n${JSON.stringify(currentData, null, 2)}\n\nREVISION INSTRUCTION: "${instruction.trim()}"`,
-        config: {
-          systemInstruction:
-            'You are a sharp, plain-English commercial copywriter. Revise ONLY the supplied website section according to the user instruction while keeping real company facts intact. Avoid buzzwords ("supercharge", "elevate", "empower"). Keep existing item IDs intact.',
-          responseMimeType: 'application/json',
-          responseSchema: schemaBySection[section],
-        },
-      })
-    );
+    try {
+      const response = await withTextModelFallback((model) =>
+        ai.models.generateContent({
+          model,
+          contents: `BUSINESS CONTEXT: ${brandSummary}\n\nCURRENT "${section.toUpperCase()}" SECTION:\n${JSON.stringify(currentData, null, 2)}\n\nREVISION INSTRUCTION: "${instruction.trim()}"`,
+          config: {
+            systemInstruction:
+              'You are a sharp, plain-English commercial copywriter. Revise ONLY the supplied website section according to the user instruction while keeping real company facts intact. Avoid buzzwords ("supercharge", "elevate", "empower"). Keep existing item IDs intact.',
+            responseMimeType: 'application/json',
+            responseSchema: schemaBySection[section],
+          },
+        })
+      );
 
-    const parsed = JSON.parse((response.text ?? '{}').trim());
-    const patch =
-      section === 'services' || section === 'projects'
-        ? { [section]: parsed.items }
-        : { [section]: parsed };
+      const parsed = JSON.parse((response.text ?? '{}').trim());
+      const existingPhotosById = new Map<string, unknown>();
+      if (section === 'projects' && Array.isArray(currentData)) {
+        for (const item of currentData) {
+          if (item && typeof item === 'object') {
+            const obj = item as Record<string, unknown>;
+            if (obj.id && obj.photoDataUrl) {
+              existingPhotosById.set(String(obj.id), obj.photoDataUrl);
+            }
+          }
+        }
+      }
+      const nextItems =
+        section === 'projects' && Array.isArray(parsed.items)
+          ? parsed.items.map((item: Record<string, unknown>) => {
+              const keptPhoto = existingPhotosById.get(String(item?.id || ''));
+              return keptPhoto ? { ...item, photoDataUrl: keptPhoto } : item;
+            })
+          : parsed.items;
 
-    res.json({ section, patch });
+      const patch =
+        section === 'services' || section === 'projects'
+          ? { [section]: nextItems }
+          : { [section]: parsed };
+
+      res.json({ section, patch });
+    } catch (geminiErr) {
+      if (isKeyOrAuthGeminiError(geminiErr)) {
+        throw geminiErr;
+      }
+      const patch = buildLocalSectionRewriteFallback(
+        section,
+        currentData,
+        brandObj,
+        instruction.trim()
+      );
+      res.json({ section, patch, usedFallback: true });
+    }
   } catch (err) {
     const { status, message } = formatApiError(err);
     res.status(status).json({ error: message });

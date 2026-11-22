@@ -59,7 +59,6 @@ export interface SessionAccessPatternAssessment {
 }
 
 export type SuiteDefaultChatModel =
-  | 'gemini-3.5-flash-lite'
   | 'gemini-3.1-flash-lite'
   | 'gemini-4-hydrogen'
   | 'gemini-4-neon'
@@ -86,7 +85,7 @@ export const PRINCIPAL_OWNER_EMAIL = 'mcollier2188@gmail.com';
 
 export const DEFAULT_STUDIO_SYSTEM_CONFIG: StudioSystemConfig = {
   defaultShareTtlHours: 72,
-  defaultChatModel: 'gemini-3.5-flash-lite',
+  defaultChatModel: 'gemini-3.1-flash-lite',
   adaptiveQualityDefault: true,
   requireVerifiedEmailForShares: true,
   auditRetentionDays: 180,
@@ -2073,13 +2072,14 @@ function sanitizeStudioConfigObject(
       : DEFAULT_STUDIO_SYSTEM_CONFIG.defaultShareTtlHours;
 
   const modelRaw = String(raw.defaultChatModel || '');
+  const normalizedModel =
+    modelRaw === 'gemini-3.5-flash-lite' ? 'gemini-3.1-flash-lite' : modelRaw;
   const defaultChatModel: SuiteDefaultChatModel =
-    modelRaw === 'gemini-3.5-flash-lite' ||
-    modelRaw === 'gemini-3.1-flash-lite' ||
-    modelRaw === 'gemini-4-hydrogen' ||
-    modelRaw === 'gemini-4-neon' ||
-    modelRaw === 'gemini-4-carbon'
-      ? modelRaw
+    normalizedModel === 'gemini-3.1-flash-lite' ||
+    normalizedModel === 'gemini-4-hydrogen' ||
+    normalizedModel === 'gemini-4-neon' ||
+    normalizedModel === 'gemini-4-carbon'
+      ? normalizedModel
       : DEFAULT_STUDIO_SYSTEM_CONFIG.defaultChatModel;
 
   const adaptiveQualityDefault =
