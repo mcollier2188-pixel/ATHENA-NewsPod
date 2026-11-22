@@ -10,6 +10,7 @@ import {
   AudioLines,
   BookOpen,
   Check,
+  Cloud,
   Copy,
   FileAudio,
   Loader2,
@@ -22,6 +23,7 @@ import {
   PhoneOff,
   Plus,
   Radio,
+  Save,
   Send,
   Square,
   Trash2,
@@ -52,6 +54,10 @@ import {
   type SuiteChatModelId,
 } from '../services/suiteApi';
 import { EditorChatView } from './EditorChatView';
+import {
+  useAiDeskTranscriptDraftSync,
+  type DraftSyncState,
+} from '../hooks/useAiDeskTranscriptDraftSync';
 
 type AiDeskTab = 'chat' | 'live' | 'transcribe' | 'editor';
 
@@ -206,7 +212,7 @@ export function AiDeskView({
   onSelectCitation,
   onSendTranscriptToSources,
 }: AiDeskViewProps) {
-  const { user, getIdToken, signInWithGoogle } = useAuth();
+  const { user, isLoading: authLoading, getIdToken, signInWithGoogle } = useAuth();
   const [subTab, setSubTab] = useState<AiDeskTab>('chat');
 
   // ---------- 1. Multi-Model Chat State (Multi-Thread) ----------
@@ -753,6 +759,79 @@ export function AiDeskView({
       if (recordIntervalRef.current) window.clearInterval(recordIntervalRef.current);
     };
   }, []);
+
+  const handleHydrateTranscribeDraft = useCallback(
+    (draft: {
+      title: string;
+      transcriptText: string;
+      durationSeconds: number;
+    }) => {
+      setTranscriptTitle(draft.title || 'Field Voice Note');
+      setLatestTranscript(draft.transcriptText);
+      if (draft.durationSeconds > 0) {
+        setRecordSeconds(draft.durationSeconds);
+      }
+    },
+    []
+  );
+
+  const handleHydrateLiveDraft = useCallback(
+    (draft: { turns: LiveTranscriptLine[]; voiceName: string }) => {
+      setLiveTranscripts(draft.turns);
+      if (
+        draft.voiceName &&
+        VOICE_OPTIONS.some((v) => v.name === draft.voiceName)
+      ) {
+        setLiveVoice(draft.voiceName as VoiceName);
+      }
+    },
+    []
+  );
+
+  const {
+    transcribeDraftState,
+    transcribeLastSavedIso,
+    liveDraftState,
+    liveLastSavedIso,
+    saveTranscribeDraftNow,
+    discardTranscribeDraft,
+    saveLiveDraftNow,
+    discardLiveDraft,
+  } = useAiDeskTranscriptDraftSync({
+    user,
+    authLoading,
+    transcriptTitle,
+    transcriptText: latestTranscript,
+    recordSeconds,
+    onHydrateTranscribeDraft: handleHydrateTranscribeDraft,
+    liveTurns: liveTranscripts,
+    liveVoice,
+    onHydrateLiveDraft: handleHydrateLiveDraft,
+  });
+
+  const formatDraftSavedLabel = (
+    state: DraftSyncState,
+    savedIso: string | null
+  ): string => {
+    const formattedTime = savedIso
+      ? new Date(savedIso).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+      : '';
+    if (state === 'saving') return 'Saving draft...';
+    if (state === 'saved' && formattedTime) {
+      return `Firestore draft · ${formattedTime}`;
+    }
+    if (state === 'local' && formattedTime) {
+      return `Local draft · ${formattedTime}`;
+    }
+    if (state === 'error') return 'Draft sync retry in 30s';
+    return user
+      ? 'Auto-saves to Firestore every 30s'
+      : 'Auto-saves locally every 30s';
+  };
 
   const runTranscription = async (
     blob: Blob,
@@ -1338,16 +1417,38 @@ export function AiDeskView({
 
           {/* Live Transcript Pane */}
           <div className="lg:col-span-7 bg-[#101319] border border-[#22D3EE]/20 rounded-xl p-5 flex flex-col min-h-[440px]">
-            <div className="flex items-center justify-between pb-3 mb-3 border-b border-white/10">
-              <h3 className="text-sm font-semibold text-[#F5F7FA]">Live Transcript</h3>
-              <button
-                type="button"
-                onClick={() => setLiveTranscripts([])}
-                disabled={liveTranscripts.length === 0}
-                className="text-xs text-[#8C96A8] hover:text-[#F5F7FA] disabled:opacity-40 cursor-pointer"
-              >
-                Clear transcript
-              </button>
+            <div className="flex items-center justify-between gap-3 pb-3 mb-3 border-b border-white/10 flex-wrap">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <h3 className="text-sm font-semibold text-[#F5F7FA]">Live Transcript</h3>
+                <span className="inline-flex items-center gap-1.5 text-[11px] text-[#8C96A8] font-mono tabular-nums">
+                  <Cloud className="w-3 h-3 text-[#22D3EE]" aria-hidden="true" />
+                  {formatDraftSavedLabel(liveDraftState, liveLastSavedIso)}
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                {liveTranscripts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => void saveLiveDraftNow()}
+                    disabled={liveDraftState === 'saving'}
+                    className="inline-flex items-center gap-1 text-xs text-[#67E8F9] hover:text-[#A5F3FC] disabled:opacity-40 cursor-pointer"
+                  >
+                    <Save className="w-3 h-3" aria-hidden="true" />
+                    Save draft
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLiveTranscripts([]);
+                    void discardLiveDraft();
+                  }}
+                  disabled={liveTranscripts.length === 0}
+                  className="text-xs text-[#8C96A8] hover:text-[#F5F7FA] disabled:opacity-40 cursor-pointer"
+                >
+                  Clear transcript
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-3 pr-1 max-h-[420px]">
@@ -1478,16 +1579,39 @@ export function AiDeskView({
           </div>
 
           <div className="lg:col-span-7 flex flex-col gap-5">
-            {/* Active Transcript Result */}
+            {/* Active Transcript Result (30s Firestore Draft Auto-Save) */}
             <div className="bg-[#101319] border border-[#22D3EE]/20 rounded-xl p-5">
-              <div className="flex items-center justify-between gap-3 mb-3">
-                <div>
-                  <h3 className="text-sm font-semibold text-[#F5F7FA]">
-                    {latestTranscript ? transcriptTitle : 'Latest Transcript'}
-                  </h3>
+              <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                <div className="min-w-0 flex-1">
+                  <input
+                    type="text"
+                    maxLength={200}
+                    value={transcriptTitle}
+                    onChange={(e) => setTranscriptTitle(e.target.value.slice(0, 200))}
+                    aria-label="Transcript draft title"
+                    placeholder="Field Voice Note"
+                    className="w-full max-w-xs bg-transparent text-sm font-semibold text-[#F5F7FA] border-b border-transparent hover:border-white/15 focus:border-[#22D3EE] focus:outline-none pb-0.5"
+                  />
+                  <p className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-[#8C96A8] font-mono tabular-nums">
+                    <Cloud className="w-3 h-3 text-[#22D3EE]" aria-hidden="true" />
+                    {formatDraftSavedLabel(
+                      transcribeDraftState,
+                      transcribeLastSavedIso
+                    )}
+                  </p>
                 </div>
-                {latestTranscript && (
+                {latestTranscript.trim() && (
                   <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => void saveTranscribeDraftNow()}
+                      disabled={transcribeDraftState === 'saving'}
+                      className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs text-[#C7D0DF] bg-[#13161C] border border-white/10 rounded-md hover:border-[#22D3EE]/40 disabled:opacity-50 cursor-pointer"
+                      title="Save transcript draft immediately"
+                    >
+                      <Save className="w-3.5 h-3.5 text-[#22D3EE]" />
+                      Save Draft
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleCopyText('latest', latestTranscript)}
@@ -1504,7 +1628,10 @@ export function AiDeskView({
                       <button
                         type="button"
                         onClick={() =>
-                          onSendTranscriptToSources(transcriptTitle, latestTranscript)
+                          onSendTranscriptToSources(
+                            transcriptTitle.trim() || 'Field Voice Note',
+                            latestTranscript
+                          )
                         }
                         className="h-8 px-2.5 inline-flex items-center gap-1.5 text-xs font-medium text-[#67E8F9] bg-[#13161C] border border-[#22D3EE]/40 hover:border-[#22D3EE] rounded-md cursor-pointer"
                       >
@@ -1524,19 +1651,30 @@ export function AiDeskView({
                     >
                       Send to Chat
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLatestTranscript('');
+                        setTranscriptTitle('Field Voice Note');
+                        void discardTranscribeDraft();
+                      }}
+                      className="h-8 px-2.5 inline-flex items-center gap-1 text-xs text-[#8C96A8] hover:text-red-300 bg-[#13161C] border border-white/10 rounded-md cursor-pointer"
+                      title="Discard active transcript draft"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 )}
               </div>
 
-              {latestTranscript ? (
-                <div className="p-4 bg-[#0B0D10] border border-white/10 rounded-lg text-sm text-[#E6ECF5] leading-relaxed whitespace-pre-wrap max-h-60 overflow-y-auto">
-                  {latestTranscript}
-                </div>
-              ) : (
-                <div className="p-8 bg-[#0B0D10] border border-dashed border-white/10 rounded-lg text-center text-xs text-[#8C96A8]">
-                  Record a voice note or upload an audio file to inspect the transcript here.
-                </div>
-              )}
+              <textarea
+                rows={latestTranscript ? 8 : 5}
+                maxLength={50000}
+                value={latestTranscript}
+                onChange={(e) => setLatestTranscript(e.target.value.slice(0, 50000))}
+                placeholder="Record a voice note, upload an audio file, or type/edit transcript notes here — drafts auto-save every 30 seconds..."
+                className="w-full p-4 bg-[#0B0D10] border border-white/10 focus:border-[#22D3EE]/50 rounded-lg text-sm text-[#E6ECF5] placeholder:text-[#6E788A] leading-relaxed focus:outline-none resize-y max-h-72"
+              />
             </div>
 
             {/* Saved Cloud Transcripts */}

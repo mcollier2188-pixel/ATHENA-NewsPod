@@ -873,6 +873,67 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidLiveTranscriptTurn(t) {
+      return t is map
+        && t.keys().hasAll(['id', 'role', 'text', 'timestamp'])
+        && t.keys().hasOnly(['id', 'role', 'text', 'timestamp'])
+        && isBoundedString(t.id, 1, 128)
+        && t.role in ['user', 'model']
+        && isBoundedString(t.text, 1, 4000)
+        && isBoundedString(t.timestamp, 1, 64);
+    }
+
+    function isValidLiveTranscriptTurnList(listVal) {
+      return listVal is list
+        && listVal.size() <= 200
+        && (listVal.size() == 0 || isValidLiveTranscriptTurn(listVal[0]));
+    }
+
+    function isValidAiDeskTranscriptDraft(data, draftId) {
+      return data.keys().hasAll([
+        'draftId',
+        'ownerId',
+        'surface',
+        'title',
+        'transcriptText',
+        'turns',
+        'voiceName',
+        'durationSeconds',
+        'clientSavedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'draftId',
+        'ownerId',
+        'surface',
+        'title',
+        'transcriptText',
+        'turns',
+        'voiceName',
+        'durationSeconds',
+        'clientSavedAtIso',
+        'createdAt',
+        'updatedAt'
+      ])
+      && isValidId(data.draftId)
+      && data.draftId == draftId
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.surface in ['transcribe', 'live']
+      && draftId == ('drf_' + request.auth.uid + '_' + data.surface)
+      && isBoundedString(data.title, 1, 200)
+      && isBoundedString(data.transcriptText, 0, 50000)
+      && isValidLiveTranscriptTurnList(data.turns)
+      && isBoundedString(data.voiceName, 0, 64)
+      && data.durationSeconds is number
+      && data.durationSeconds >= 0
+      && data.durationSeconds <= 14400
+      && isBoundedString(data.clientSavedAtIso, 1, 64)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
     // ---------- Action Helpers for Updates ----------
 
     function isSelfProfileMetadataSyncAction(userId) {
@@ -1002,6 +1063,15 @@ service cloud.firestore {
         && incoming().ownerId == existing().ownerId
         && incoming().kind == existing().kind
         && incoming().externalId == existing().externalId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function isAiDeskTranscriptDraftOwnerSyncAction() {
+      return isOwner(existing().ownerId)
+        && incoming().draftId == existing().draftId
+        && incoming().ownerId == existing().ownerId
+        && incoming().surface == existing().surface
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time;
     }
@@ -1534,6 +1604,48 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser()
         && isValidId(docId)
+        && resource != null
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // ---------- Collection: /aiDeskTranscriptDrafts/{draftId} ----------
+
+    match /aiDeskTranscriptDrafts/{draftId} {
+      allow get: if isVerifiedUser()
+        && isValidId(draftId)
+        && (
+          (resource != null && (existing().ownerId == request.auth.uid || isPrincipalOwner()))
+          || (resource == null && (draftId.matches('^drf_' + request.auth.uid + '_(transcribe|live)$') || isPrincipalOwner()))
+        );
+
+      // Zero get()/exists() inside list: strictly enforces owner-scoped where('ownerId', '==', request.auth.uid) queries
+      allow list: if isVerifiedUser()
+        && ('ownerId' in existing() && existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(draftId)
+        && isValidAiDeskTranscriptDraft(incoming(), draftId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(draftId)
+        && isValidAiDeskTranscriptDraft(incoming(), draftId)
+        && (
+          isAiDeskTranscriptDraftOwnerSyncAction()
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'transcriptText',
+            'turns',
+            'voiceName',
+            'durationSeconds',
+            'clientSavedAtIso',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(draftId)
         && resource != null
         && existing().ownerId == request.auth.uid;
     }

@@ -1,3 +1,5 @@
+import { normalizeWavAudioBase64 } from './audioNormalization';
+
 export function formatClock(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
   const whole = Math.floor(seconds);
@@ -80,10 +82,18 @@ function parseWavBuffer(bytes: Uint8Array): ParsedWav | null {
  * Stitches multiple Gemini unary WAV clips (24kHz mono 16-bit PCM) into a single
  * clean downloadable WAV file with subtle 350ms silence breath between chapters.
  */
-export function stitchWavBase64Clips(base64Clips: string[]): Blob | null {
+export function stitchWavBase64Clips(
+  base64Clips: string[],
+  options?: { normalizeTargetLufs?: number | null }
+): Blob | null {
   const parsedClips: ParsedWav[] = [];
+  const targetLufs = options?.normalizeTargetLufs;
   for (const clip of base64Clips) {
-    const bytes = base64ToUint8Array(clip);
+    const processedClip =
+      typeof targetLufs === 'number' && Number.isFinite(targetLufs)
+        ? normalizeWavAudioBase64(clip, { targetLufs }).audioBase64
+        : clip;
+    const bytes = base64ToUint8Array(processedClip);
     const parsed = parseWavBuffer(bytes);
     if (parsed) {
       parsedClips.push(parsed);

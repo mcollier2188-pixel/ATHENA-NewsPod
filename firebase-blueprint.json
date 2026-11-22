@@ -898,6 +898,90 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "AiDeskTranscriptDraft": {
+      "title": "AiDeskTranscriptDraft",
+      "description": "Owner-scoped 30-second auto-saved AI Desk transcript draft for Speech-to-Text and Gemini Live Voice sessions to prevent data loss.",
+      "type": "object",
+      "properties": {
+        "draftId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic owner-scoped Firestore document ID (drf_<uid>_transcribe or drf_<uid>_live)."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Immutable Firebase Auth UID of the draft owner."
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "transcribe",
+            "live"
+          ],
+          "description": "AI Desk transcript surface (Speech-to-Text transcribe desk or Live Voice studio)."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Human-readable draft title."
+        },
+        "transcriptText": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 50000,
+          "description": "Bounded full transcript text auto-saved every 30 seconds."
+        },
+        "turns": {
+          "type": "array",
+          "description": "Bounded list (max 200) of spoken Live Voice turns ({ id, role, text, timestamp }, text <= 4000 chars), or empty list for transcribe drafts."
+        },
+        "voiceName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64,
+          "description": "Selected Gemini Live voice name when surface is live, or empty string."
+        },
+        "durationSeconds": {
+          "type": "number",
+          "description": "Recorded clip or live session duration in seconds (0..14400)."
+        },
+        "clientSavedAtIso": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO-8601 timestamp when the 30-second client auto-save fired."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp set at initial draft creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on every 30-second auto-save."
+        }
+      },
+      "required": [
+        "draftId",
+        "ownerId",
+        "surface",
+        "title",
+        "transcriptText",
+        "turns",
+        "voiceName",
+        "durationSeconds",
+        "clientSavedAtIso",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -948,6 +1032,12 @@
         "$ref": "#/entities/WorkspaceLink"
       },
       "description": "Owner-scoped Google Workspace links connecting Dispatch sources and briefings with Drive files, formatted Docs, WAV episodes, and Tasks."
+    },
+    "/aiDeskTranscriptDrafts/{draftId}": {
+      "schema": {
+        "$ref": "#/entities/AiDeskTranscriptDraft"
+      },
+      "description": "Owner-scoped AI Desk transcript drafts auto-saved every 30 seconds for Speech-to-Text and Live Voice sessions."
     }
   }
 }

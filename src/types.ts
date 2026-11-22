@@ -128,6 +128,9 @@ export interface BriefingSegment {
   audioBase64?: string;
   audioDurationSeconds?: number;
   audioStale?: boolean;
+  loudnessLufs?: number;
+  gainAppliedDb?: number;
+  peakDbfs?: number;
 }
 
 export interface AudioBriefing {

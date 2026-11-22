@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import type { NewsArticle, SourceType } from '../types';
+import type { TaggingQueueSnapshot } from '../utils/sourceTaggingQueue';
 
 interface SourcesSidebarProps {
   sources: NewsArticle[];
@@ -26,6 +27,7 @@ interface SourcesSidebarProps {
   isUploading: boolean;
   uploadStatus: string | null;
   isTagging: boolean;
+  taggingQueueSnapshot?: TaggingQueueSnapshot;
   isRefreshingArticles: boolean;
   refreshArticlesStatus: string | null;
   queueTab?: 'active' | 'readLater';
@@ -76,6 +78,7 @@ export function SourcesSidebar({
   isUploading,
   uploadStatus,
   isTagging,
+  taggingQueueSnapshot,
   isRefreshingArticles,
   refreshArticlesStatus,
   queueTab,
@@ -277,9 +280,7 @@ export function SourcesSidebar({
             onClick={() => {
               void onRefreshAllArticles();
             }}
-            disabled={
-              sources.length === 0 || isUploading || isRefreshingArticles || isTagging
-            }
+            disabled={sources.length === 0 || isUploading || isRefreshingArticles}
             title="Re-fetch content for all URL sources and regenerate automatic topic tags"
             className="w-full h-8 px-3 inline-flex items-center justify-center gap-1.5 text-xs font-medium text-[#C7D0DF] hover:text-[#67E8F9] bg-[#0E1116] hover:bg-[#151B24] border border-[#273040] hover:border-[#22D3EE]/45 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap cursor-pointer"
           >
@@ -334,21 +335,31 @@ export function SourcesSidebar({
             <span>Select all</span>
           </button>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 shrink-0">
             {notebookSources.length > 0 && (
               <button
                 type="button"
                 onClick={onAutoTagSources}
                 disabled={isTagging}
-                title="Refresh automatic context tags for all sources"
-                className="inline-flex items-center gap-1 text-[11px] text-[#6E788A] hover:text-[#67E8F9] disabled:opacity-50 transition-colors cursor-pointer"
+                title={
+                  isTagging && taggingQueueSnapshot && taggingQueueSnapshot.totalInRun > 0
+                    ? `Batch tagging queue: ${taggingQueueSnapshot.completedInRun} of ${taggingQueueSnapshot.totalInRun} completed (${taggingQueueSnapshot.activeBatches} active ${taggingQueueSnapshot.activeBatches === 1 ? 'batch' : 'batches'})`
+                    : 'Refresh automatic context tags for all sources'
+                }
+                className="inline-flex items-center gap-1 text-[11px] text-[#6E788A] hover:text-[#67E8F9] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 {isTagging ? (
-                  <Loader2 className="w-3 h-3 animate-spin text-[#22D3EE]" aria-hidden="true" />
+                  <Loader2 className="w-3 h-3 animate-spin text-[#22D3EE] shrink-0" aria-hidden="true" />
                 ) : (
-                  <Sparkles className="w-3 h-3 text-[#22D3EE]" aria-hidden="true" />
+                  <Sparkles className="w-3 h-3 text-[#22D3EE] shrink-0" aria-hidden="true" />
                 )}
-                <span>{isTagging ? 'Tagging' : 'Auto-tag'}</span>
+                <span className="font-mono tabular-nums">
+                  {isTagging
+                    ? taggingQueueSnapshot && taggingQueueSnapshot.totalInRun > 1
+                      ? `Tagging ${taggingQueueSnapshot.completedInRun}/${taggingQueueSnapshot.totalInRun}`
+                      : 'Tagging'
+                    : 'Auto-tag'}
+                </span>
               </button>
             )}
             <button
@@ -590,7 +601,15 @@ export function SourcesSidebar({
                             );
                           })}
                         </div>
-                      ) : isTagging ? (
+                      ) : taggingQueueSnapshot?.inFlightIds.has(src.id) ? (
+                        <p className="mt-1 font-mono text-[10px] text-[#67E8F9]/80">
+                          Generating tags...
+                        </p>
+                      ) : taggingQueueSnapshot?.queuedIds.has(src.id) ? (
+                        <p className="mt-1 font-mono text-[10px] text-[#6E788A]">
+                          Queued in batch...
+                        </p>
+                      ) : isTagging && !taggingQueueSnapshot ? (
                         <p className="mt-1 font-mono text-[10px] text-[#6E788A]">
                           Generating tags...
                         </p>

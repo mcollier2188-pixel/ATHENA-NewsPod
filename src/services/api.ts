@@ -16,6 +16,7 @@ import type {
   ShareTtlHours,
   SiteMockupProject,
 } from '../types';
+import type { WavLoudnessMetrics } from '../utils/audioNormalization';
 
 export interface ShareAuthOptions {
   token?: string | null;
@@ -178,8 +179,18 @@ export async function synthesizeSpeech(payload: {
   coHostVoiceName?: string;
   tone: string;
   voiceTone?: string;
-}): Promise<{ audioBase64: string; mimeType: string }> {
-  return postJson<{ audioBase64: string; mimeType: string }>('/api/tts/synthesize', payload);
+  normalizeLoudness?: boolean;
+  targetLufs?: number;
+}): Promise<{
+  audioBase64: string;
+  mimeType: string;
+  loudness?: WavLoudnessMetrics;
+}> {
+  return postJson<{
+    audioBase64: string;
+    mimeType: string;
+    loudness?: WavLoudnessMetrics;
+  }>('/api/tts/synthesize', payload);
 }
 
 export async function sendEditorChatMessage(payload: {

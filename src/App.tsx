@@ -40,6 +40,12 @@ import {
   stitchWavBase64Clips,
 } from './utils/wavUtils';
 import {
+  DEFAULT_LOUDNESS_TARGET_LUFS,
+  measureWavLoudnessBase64,
+  normalizeWavAudioBase64,
+  type LoudnessTargetPreset,
+} from './utils/audioNormalization';
+import {
   deleteBriefingAudio,
   loadBriefingAudio,
   saveSegmentAudio,
@@ -69,6 +75,7 @@ import { AiDeskView } from './components/AiDeskView';
 import type { DriveFileItem } from './services/googleDriveService';
 import type { GoogleTaskItem } from './services/googleTasksService';
 import {
+  batchUpsertNotebookSourcesToFirestore,
   deleteBriefingArchiveFromFirestore,
   deleteNotebookSourceFromFirestore,
   subscribeToBriefingArchives,
@@ -80,6 +87,12 @@ import {
   upsertNotebookSourceToFirestore,
   upsertWorkspaceLinkToFirestore,
 } from './services/firestoreWorkspaceSync';
+import {
+  EMPTY_TAGGING_QUEUE_SNAPSHOT,
+  SourceTaggingQueue,
+  mapWithConcurrency,
+  type TaggingQueueSnapshot,
+} from './utils/sourceTaggingQueue';
 import {
   MediaLabView,
   type GeneratedSessionImage,
@@ -432,8 +445,11 @@ export default function App() {
     null
   );
   const [refreshArticlesError, setRefreshArticlesError] = useState<string | null>(null);
-  const [isTagging, setIsTagging] = useState(false);
+  const [taggingQueueSnapshot, setTaggingQueueSnapshot] =
+    useState<TaggingQueueSnapshot>(EMPTY_TAGGING_QUEUE_SNAPSHOT);
+  const isTagging = taggingQueueSnapshot.isProcessing;
   const autoTagAttemptedIdsRef = useRef<Set<string>>(new Set());
+  const taggingQueueRef = useRef<SourceTaggingQueue | null>(null);
 
   // Notebook Sources modal, Google Workspace modals/drawers, mobile drawer & Source Guide inspector
   const [addModalOpen, setAddModalOpen] = useState(false);
@@ -461,6 +477,25 @@ export default function App() {
   const [synthesizingSegmentId, setSynthesizingSegmentId] = useState<string | null>(null);
   const [isSynthesizingAll, setIsSynthesizingAll] = useState(false);
   const [ttsError, setTtsError] = useState<string | null>(null);
+  const [loudnessNormEnabled, setLoudnessNormEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('dispatch_loudness_norm_enabled');
+      return saved === null ? true : saved !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [loudnessTargetLufs, setLoudnessTargetLufs] = useState<LoudnessTargetPreset>(
+    () => {
+      try {
+        const raw = Number(localStorage.getItem('dispatch_loudness_target_lufs'));
+        if (raw === -14 || raw === -16 || raw === -18) return raw;
+      } catch {
+        // ignore storage errors
+      }
+      return DEFAULT_LOUDNESS_TARGET_LUFS;
+    }
+  );
 
   const [isRefining, setIsRefining] = useState(false);
   const [refineError, setRefineError] = useState<string | null>(null);
@@ -530,9 +565,11 @@ export default function App() {
   const chatAudioRef = useRef<HTMLAudioElement | null>(null);
   const chatAudioUrlRef = useRef<string | null>(null);
 
-  // Keep live state refs for initial Firestore cloud bootstrap without re-subscribing
+  // Keep live state refs for initial Firestore cloud bootstrap and async batch workers
   const articlesRef = useRef<NewsArticle[]>(articles);
   articlesRef.current = articles;
+  const verifiedOwnerIdRef = useRef<string | null>(verifiedOwnerId);
+  verifiedOwnerIdRef.current = verifiedOwnerId;
   const archiveRef = useRef<AudioBriefing[]>(archive);
   archiveRef.current = archive;
   const playbackPositionsRef = useRef<Record<string, PlaybackPosition>>(playbackPositions);
@@ -569,11 +606,9 @@ export default function App() {
         bootstrappedSourcesUidRef.current = verifiedOwnerId;
         const seedSources = articlesRef.current;
         if (seedSources.length > 0) {
-          void Promise.all(
-            seedSources.map((src) =>
-              upsertNotebookSourceToFirestore(verifiedOwnerId, src)
-            )
-          ).finally(() => setCloudSyncStatus('synced'));
+          void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, seedSources).finally(
+            () => setCloudSyncStatus('synced')
+          );
         } else {
           setCloudSyncStatus('synced');
         }
@@ -736,8 +771,58 @@ export default function App() {
     };
   }, [verifiedOwnerId]);
 
-  // Automatically generate context-relevant tags for any sources missing tags
+  // Persistent concurrent batch-processing queue for automatic source tagging
   useEffect(() => {
+    const queue = new SourceTaggingQueue({
+      batchSize: 8,
+      maxConcurrency: 3,
+      coalesceDelayMs: 120,
+      maxRetries: 1,
+      processor: (batch) => generateSourceTags(batch),
+      onBatchResolved: (tagsById) => {
+        const updatedItems: NewsArticle[] = [];
+        const nextArticles = articlesRef.current.map((a) => {
+          const resolved = tagsById[a.id];
+          if (resolved && resolved.length > 0) {
+            const updated = { ...a, tags: resolved };
+            updatedItems.push(updated);
+            return updated;
+          }
+          return a;
+        });
+        if (updatedItems.length === 0) return;
+
+        articlesRef.current = nextArticles;
+        setArticles(nextArticles);
+
+        const ownerUid = verifiedOwnerIdRef.current;
+        if (ownerUid) {
+          void batchUpsertNotebookSourcesToFirestore(ownerUid, updatedItems);
+        }
+      },
+      onStateChange: (snapshot) => {
+        setTaggingQueueSnapshot(snapshot);
+      },
+    });
+
+    taggingQueueRef.current = queue;
+
+    return () => {
+      const pending = queue.getSnapshot();
+      pending.queuedIds.forEach((id) => autoTagAttemptedIdsRef.current.delete(id));
+      pending.inFlightIds.forEach((id) => autoTagAttemptedIdsRef.current.delete(id));
+      queue.dispose();
+      if (taggingQueueRef.current === queue) {
+        taggingQueueRef.current = null;
+      }
+    };
+  }, []);
+
+  // Automatically enqueue any untagged sources into the concurrent batch tagging queue
+  useEffect(() => {
+    const queue = taggingQueueRef.current;
+    if (!queue) return;
+
     const untagged = articles.filter(
       (a) =>
         (!a.tags || a.tags.length === 0) &&
@@ -746,10 +831,7 @@ export default function App() {
     if (untagged.length === 0) return;
 
     untagged.forEach((a) => autoTagAttemptedIdsRef.current.add(a.id));
-    let cancelled = false;
-
-    setIsTagging(true);
-    generateSourceTags(
+    void queue.enqueue(
       untagged.map((a) => ({
         id: a.id,
         title: a.title,
@@ -757,36 +839,8 @@ export default function App() {
         content: a.content,
         category: a.category,
       }))
-    )
-      .then((tagsById) => {
-        if (cancelled) return;
-        const updatedItems = articlesRef.current
-          .filter((a) => tagsById[a.id] && tagsById[a.id].length > 0)
-          .map((a) => ({ ...a, tags: tagsById[a.id] }));
-        setArticles((prev) =>
-          prev.map((a) =>
-            tagsById[a.id] && tagsById[a.id].length > 0
-              ? { ...a, tags: tagsById[a.id] }
-              : a
-          )
-        );
-        if (verifiedOwnerId && updatedItems.length > 0) {
-          for (const item of updatedItems) {
-            void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
-          }
-        }
-      })
-      .catch(() => {
-        // Silently skip auto-tag failure so UI stays responsive
-      })
-      .finally(() => {
-        if (!cancelled) setIsTagging(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [articles, verifiedOwnerId]);
+    );
+  }, [articles]);
 
   useEffect(() => {
     try {
@@ -1096,12 +1150,15 @@ export default function App() {
           const cached = audioMap[seg.id];
           if (!cached) return seg;
           const exactSeconds = getWavDurationSeconds(cached);
+          const measured = measureWavLoudnessBase64(cached, loudnessTargetLufs);
           return {
             ...seg,
             audioBase64: cached,
             audioDurationSeconds:
               exactSeconds > 0 ? exactSeconds : seg.audioDurationSeconds,
             audioStale: false,
+            loudnessLufs: measured?.outputLufs ?? seg.loudnessLufs,
+            peakDbfs: measured?.peakDbfs ?? seg.peakDbfs,
           };
         }),
       };
@@ -1147,20 +1204,20 @@ export default function App() {
     []
   );
 
-  // Upload user documents (PDF, DOCX, TXT, Markdown) into Notebook Sources
+  // Upload user documents (PDF, DOCX, TXT, Markdown) concurrently and stream into the batch tagging queue
   const handleUploadFiles = useCallback(
     async (files: FileList | File[]): Promise<boolean> => {
       const fileArray = Array.from(files);
       if (fileArray.length === 0) return false;
 
       const MAX_BYTES = 15 * 1024 * 1024;
+      const UPLOAD_CONCURRENCY = 4;
       setIngestError(null);
       setIsIngesting(true);
 
-      let uploadedCount = 0;
+      const importedIds: string[] = [];
       try {
-        for (let i = 0; i < fileArray.length; i++) {
-          const file = fileArray[i];
+        const prepared = fileArray.map((file) => {
           const lower = file.name.toLowerCase();
           const isPdf = lower.endsWith('.pdf') || file.type === 'application/pdf';
           const isDocx =
@@ -1181,52 +1238,96 @@ export default function App() {
           if (file.size > MAX_BYTES) {
             throw new Error(`"${file.name}" exceeds the 15 MB limit.`);
           }
+          return { file, isPdf, isDocx, isMd };
+        });
 
-          setUploadStatus(
-            `Indexing ${file.name} (${i + 1} of ${fileArray.length})...`
-          );
+        let completed = 0;
+        const total = prepared.length;
+        setUploadStatus(
+          total === 1
+            ? `Indexing ${prepared[0].file.name}...`
+            : `Indexing ${total} documents (0/${total})...`
+        );
 
-          let extracted: Omit<NewsArticle, 'id' | 'selected' | 'addedAt'>;
-          if (isPdf || isDocx) {
-            const base64Data = await readFileAsBase64(file);
-            extracted = await uploadDocumentSource({
-              fileName: file.name,
-              mimeType:
-                file.type ||
-                (isPdf
-                  ? 'application/pdf'
-                  : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
-              base64Data,
-              fileSizeBytes: file.size,
+        await mapWithConcurrency(
+          prepared,
+          UPLOAD_CONCURRENCY,
+          async ({ file, isPdf, isDocx, isMd }, index) => {
+            let extracted: Omit<NewsArticle, 'id' | 'selected' | 'addedAt'>;
+            if (isPdf || isDocx) {
+              const base64Data = await readFileAsBase64(file);
+              extracted = await uploadDocumentSource({
+                fileName: file.name,
+                mimeType:
+                  file.type ||
+                  (isPdf
+                    ? 'application/pdf'
+                    : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+                base64Data,
+                fileSizeBytes: file.size,
+              });
+            } else {
+              const textContent = await file.text();
+              extracted = await uploadDocumentSource({
+                fileName: file.name,
+                mimeType: file.type || (isMd ? 'text/markdown' : 'text/plain'),
+                textContent,
+                fileSizeBytes: file.size,
+              });
+            }
+
+            const newSource = ensureArticlePassages({
+              ...extracted,
+              id: `src-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+              selected: true,
+              addedAt: new Date().toISOString(),
             });
-          } else {
-            const textContent = await file.text();
-            extracted = await uploadDocumentSource({
-              fileName: file.name,
-              mimeType: file.type || (isMd ? 'text/markdown' : 'text/plain'),
-              textContent,
-              fileSizeBytes: file.size,
-            });
-          }
 
-          const newSource = ensureArticlePassages({
-            ...extracted,
-            id: `src-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            selected: true,
-            addedAt: new Date().toISOString(),
-          });
-          setArticles((prev) => [newSource, ...prev]);
-          if (verifiedOwnerId) {
-            void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
+            if (!newSource.tags || newSource.tags.length === 0) {
+              autoTagAttemptedIdsRef.current.add(newSource.id);
+            }
+
+            importedIds.push(newSource.id);
+            const nextArticles = [newSource, ...articlesRef.current];
+            articlesRef.current = nextArticles;
+            setArticles(nextArticles);
+
+            if (!newSource.tags || newSource.tags.length === 0) {
+              void taggingQueueRef.current?.enqueue([
+                {
+                  id: newSource.id,
+                  title: newSource.title,
+                  summary: newSource.summary,
+                  content: newSource.content,
+                  category: newSource.category,
+                },
+              ]);
+            }
+
+            completed += 1;
+            if (completed < total) {
+              setUploadStatus(`Indexing ${total} documents (${completed}/${total})...`);
+            }
           }
-          uploadedCount++;
+        );
+
+        if (verifiedOwnerId && importedIds.length > 0) {
+          const importedIdSet = new Set(importedIds);
+          const freshSources = articlesRef.current.filter((a) => importedIdSet.has(a.id));
+          void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, freshSources);
         }
-        return uploadedCount > 0;
+
+        return importedIds.length > 0;
       } catch (err) {
+        if (verifiedOwnerId && importedIds.length > 0) {
+          const importedIdSet = new Set(importedIds);
+          const freshSources = articlesRef.current.filter((a) => importedIdSet.has(a.id));
+          void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, freshSources);
+        }
         setIngestError(
           err instanceof Error ? err.message : 'Failed to upload document.'
         );
-        return uploadedCount > 0;
+        return importedIds.length > 0;
       } finally {
         setIsIngesting(false);
         setUploadStatus(null);
@@ -1235,7 +1336,7 @@ export default function App() {
     [readFileAsBase64, verifiedOwnerId]
   );
 
-  // Import Google Docs & Drive files while preserving Drive provenance and syncing to Firestore
+  // Import Google Docs & Drive files concurrently while preserving Drive provenance and batch-tagging
   const handleImportDriveItems = useCallback(
     async (
       items: Array<{ file: File; driveItem: DriveFileItem }>
@@ -1243,15 +1344,15 @@ export default function App() {
       if (items.length === 0) return false;
 
       const MAX_BYTES = 15 * 1024 * 1024;
+      const DRIVE_IMPORT_CONCURRENCY = 4;
       setIngestError(null);
       setIsIngesting(true);
 
-      let importedCount = 0;
+      const importedIds: string[] = [];
       let firstTitle = '';
 
       try {
-        for (let i = 0; i < items.length; i++) {
-          const { file, driveItem } = items[i];
+        const prepared = items.map(({ file, driveItem }) => {
           const lower = file.name.toLowerCase();
           const isPdf = lower.endsWith('.pdf') || file.type === 'application/pdf';
           const isDocx =
@@ -1266,83 +1367,129 @@ export default function App() {
           if (file.size > MAX_BYTES) {
             throw new Error(`"${file.name}" exceeds the 15 MB limit.`);
           }
+          return { file, driveItem, isPdf, isDocx, isMd };
+        });
 
-          setUploadStatus(
-            `Indexing "${driveItem.name}" from Google Drive (${i + 1} of ${items.length})...`
-          );
+        let completed = 0;
+        const total = prepared.length;
+        setUploadStatus(
+          total === 1
+            ? `Indexing "${prepared[0].driveItem.name}" from Google Drive...`
+            : `Importing ${total} Drive documents (0/${total})...`
+        );
 
-          let extracted: Omit<NewsArticle, 'id' | 'selected' | 'addedAt'>;
-          if (isPdf || isDocx) {
-            const base64Data = await readFileAsBase64(file);
-            extracted = await uploadDocumentSource({
-              fileName: file.name,
-              mimeType:
-                file.type ||
-                (isPdf
-                  ? 'application/pdf'
-                  : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
-              base64Data,
-              fileSizeBytes: file.size,
+        await mapWithConcurrency(
+          prepared,
+          DRIVE_IMPORT_CONCURRENCY,
+          async ({ file, driveItem, isPdf, isDocx, isMd }, index) => {
+            let extracted: Omit<NewsArticle, 'id' | 'selected' | 'addedAt'>;
+            if (isPdf || isDocx) {
+              const base64Data = await readFileAsBase64(file);
+              extracted = await uploadDocumentSource({
+                fileName: file.name,
+                mimeType:
+                  file.type ||
+                  (isPdf
+                    ? 'application/pdf'
+                    : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+                base64Data,
+                fileSizeBytes: file.size,
+              });
+            } else {
+              const textContent = await file.text();
+              extracted = await uploadDocumentSource({
+                fileName: file.name,
+                mimeType: file.type || (isMd ? 'text/markdown' : 'text/plain'),
+                textContent,
+                fileSizeBytes: file.size,
+              });
+            }
+
+            const isGoogleDoc =
+              driveItem.mimeType === 'application/vnd.google-apps.document';
+            const newSource = ensureArticlePassages({
+              ...extracted,
+              id: `drv-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+              source: isGoogleDoc ? 'Google Docs' : extracted.source || 'Google Drive',
+              url: driveItem.webViewLink || extracted.url,
+              driveFileId: driveItem.id,
+              driveWebViewLink: driveItem.webViewLink,
+              driveMimeType: driveItem.mimeType,
+              selected: true,
+              addedAt: new Date().toISOString(),
             });
-          } else {
-            const textContent = await file.text();
-            extracted = await uploadDocumentSource({
-              fileName: file.name,
-              mimeType: file.type || (isMd ? 'text/markdown' : 'text/plain'),
-              textContent,
-              fileSizeBytes: file.size,
-            });
+
+            if (!firstTitle) firstTitle = newSource.title;
+            if (!newSource.tags || newSource.tags.length === 0) {
+              autoTagAttemptedIdsRef.current.add(newSource.id);
+            }
+
+            importedIds.push(newSource.id);
+            const nextArticles = [newSource, ...articlesRef.current];
+            articlesRef.current = nextArticles;
+            setArticles(nextArticles);
+
+            if (!newSource.tags || newSource.tags.length === 0) {
+              void taggingQueueRef.current?.enqueue([
+                {
+                  id: newSource.id,
+                  title: newSource.title,
+                  summary: newSource.summary,
+                  content: newSource.content,
+                  category: newSource.category,
+                },
+              ]);
+            }
+
+            if (verifiedOwnerId) {
+              void upsertWorkspaceLinkToFirestore(verifiedOwnerId, {
+                kind: 'drive_source',
+                externalId: driveItem.id,
+                title: newSource.title,
+                url: driveItem.webViewLink,
+                sourceId: newSource.id,
+              });
+            }
+
+            completed += 1;
+            if (completed < total) {
+              setUploadStatus(
+                `Importing ${total} Drive documents (${completed}/${total})...`
+              );
+            }
           }
+        );
 
-          const isGoogleDoc =
-            driveItem.mimeType === 'application/vnd.google-apps.document';
-          const newSource = ensureArticlePassages({
-            ...extracted,
-            id: `drv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            source: isGoogleDoc ? 'Google Docs' : extracted.source || 'Google Drive',
-            url: driveItem.webViewLink || extracted.url,
-            driveFileId: driveItem.id,
-            driveWebViewLink: driveItem.webViewLink,
-            driveMimeType: driveItem.mimeType,
-            selected: true,
-            addedAt: new Date().toISOString(),
-          });
-
-          if (!firstTitle) firstTitle = newSource.title;
-          setArticles((prev) => [newSource, ...prev]);
-
-          if (verifiedOwnerId) {
-            void upsertNotebookSourceToFirestore(verifiedOwnerId, newSource);
-            void upsertWorkspaceLinkToFirestore(verifiedOwnerId, {
-              kind: 'drive_source',
-              externalId: driveItem.id,
-              title: newSource.title,
-              url: driveItem.webViewLink,
-              sourceId: newSource.id,
-            });
-          }
-          importedCount++;
+        if (verifiedOwnerId && importedIds.length > 0) {
+          const importedIdSet = new Set(importedIds);
+          const freshSources = articlesRef.current.filter((a) => importedIdSet.has(a.id));
+          void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, freshSources);
         }
 
-        if (importedCount > 0) {
+        if (importedIds.length > 0) {
           showTransferToast({
             target: 'notebook',
             title:
-              importedCount === 1
+              importedIds.length === 1
                 ? 'Imported from Google Drive'
-                : `Imported ${importedCount} Drive Documents`,
+                : `Imported ${importedIds.length} Drive Documents`,
             description:
               'Indexed passages for clickable citations and synced to your workspace.',
             label: firstTitle || 'Google Drive Source',
           });
         }
 
-        return importedCount > 0;
+        return importedIds.length > 0;
       } catch (err) {
+        if (verifiedOwnerId && importedIds.length > 0) {
+          const importedIdSet = new Set(importedIds);
+          const freshSources = articlesRef.current.filter((a) => importedIdSet.has(a.id));
+          void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, freshSources);
+        }
         setIngestError(
           err instanceof Error ? err.message : 'Failed to import from Google Drive.'
         );
-        return importedCount > 0;
+        return importedIds.length > 0;
       } finally {
         setIsIngesting(false);
         setUploadStatus(null);
@@ -1408,9 +1555,7 @@ export default function App() {
         prev.map((a) => (a.readLater ? a : { ...a, selected }))
       );
       if (verifiedOwnerId && changed.length > 0) {
-        for (const item of changed) {
-          void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
-        }
+        void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, changed);
       }
     },
     [verifiedOwnerId]
@@ -1437,9 +1582,7 @@ export default function App() {
       setArticles(nextArticles);
 
       if (verifiedOwnerId) {
-        for (const item of changed) {
-          void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
-        }
+        void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, changed);
       }
     },
     [verifiedOwnerId]
@@ -1493,14 +1636,14 @@ export default function App() {
       )
     );
     if (verifiedOwnerId && restored.length > 0) {
-      for (const item of restored) {
-        void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
-      }
+      void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, restored);
     }
   }, [verifiedOwnerId]);
 
   const handleRemoveArticle = useCallback(
     (id: string) => {
+      taggingQueueRef.current?.remove(id);
+      autoTagAttemptedIdsRef.current.delete(id);
       setArticles((prev) => prev.filter((a) => a.id !== id));
       setInspectedTarget((prev) => (prev?.sourceId === id ? null : prev));
       if (verifiedOwnerId) {
@@ -1524,6 +1667,10 @@ export default function App() {
     const removedIds = articlesRef.current
       .filter((a) => !a.readLater && !sampleIds.has(a.id))
       .map((a) => a.id);
+    removedIds.forEach((id) => {
+      taggingQueueRef.current?.remove(id);
+      autoTagAttemptedIdsRef.current.delete(id);
+    });
     setArticles((prev) => {
       const keptReadLater = prev.filter(
         (a) => Boolean(a.readLater) && !sampleIds.has(a.id)
@@ -1534,9 +1681,7 @@ export default function App() {
       for (const id of removedIds) {
         void deleteNotebookSourceFromFirestore(verifiedOwnerId, id);
       }
-      for (const sample of freshSamples) {
-        void upsertNotebookSourceToFirestore(verifiedOwnerId, sample);
-      }
+      void batchUpsertNotebookSourcesToFirestore(verifiedOwnerId, freshSamples);
     }
   }, [verifiedOwnerId]);
 
@@ -1548,47 +1693,21 @@ export default function App() {
       if (sourceList.length === 0) return;
 
       sourceList.forEach((a) => autoTagAttemptedIdsRef.current.add(a.id));
-      setIsTagging(true);
-      try {
-        const mergedTagsById: Record<string, string[]> = {};
-        for (let offset = 0; offset < sourceList.length; offset += 20) {
-          const batch = sourceList.slice(offset, offset + 20);
-          const batchTags = await generateSourceTags(
-            batch.map((a) => ({
-              id: a.id,
-              title: a.title,
-              summary: a.summary,
-              content: a.content,
-              category: a.category,
-            }))
-          );
-          Object.assign(mergedTagsById, batchTags);
-        }
+      const queue = taggingQueueRef.current;
+      if (!queue) return;
 
-        const nextArticles = articlesRef.current.map((a) =>
-          mergedTagsById[a.id] && mergedTagsById[a.id].length > 0
-            ? { ...a, tags: mergedTagsById[a.id] }
-            : a
-        );
-        const updatedItems = nextArticles.filter(
-          (a) => mergedTagsById[a.id] && mergedTagsById[a.id].length > 0
-        );
-
-        articlesRef.current = nextArticles;
-        setArticles(nextArticles);
-
-        if (verifiedOwnerId && updatedItems.length > 0) {
-          for (const item of updatedItems) {
-            void upsertNotebookSourceToFirestore(verifiedOwnerId, item);
-          }
-        }
-      } catch {
-        // Non-fatal: keep existing tags intact
-      } finally {
-        setIsTagging(false);
-      }
+      await queue.enqueue(
+        sourceList.map((a) => ({
+          id: a.id,
+          title: a.title,
+          summary: a.summary,
+          content: a.content,
+          category: a.category,
+        })),
+        { force: true }
+      );
     },
-    [verifiedOwnerId]
+    []
   );
 
   const handleAutoTagSources = useCallback(async () => {
@@ -1953,7 +2072,7 @@ export default function App() {
     [verifiedOwnerId]
   );
 
-  // Synthesize audio for a single chapter using gemini-3.8-flash-tts
+  // Synthesize audio for a single chapter using gemini-3.8-flash-tts + broadcast loudness normalization
   const synthesizeOneSegment = useCallback(
     async (briefingObj: AudioBriefing, segmentId: string): Promise<AudioBriefing> => {
       const segment = briefingObj.segments.find((s) => s.id === segmentId);
@@ -1970,20 +2089,47 @@ export default function App() {
             segment.coHostVoiceName || briefingObj.preferences.coHostVoiceName,
           tone: briefingObj.preferences.tone,
           voiceTone: briefingObj.preferences.voiceTone || 'professional',
+          normalizeLoudness: loudnessNormEnabled,
+          targetLufs: loudnessTargetLufs,
         });
 
-        const exactSeconds = getWavDurationSeconds(result.audioBase64);
-        // Cache chapter WAV in IndexedDB for seamless resume across page reloads
-        saveSegmentAudio(briefingObj.id, segmentId, result.audioBase64);
+        // Verify or apply loudness normalization so chapter volume is guaranteed consistent
+        let finalAudioBase64 = result.audioBase64;
+        let loudnessMetrics = result.loudness ?? null;
+        if (loudnessNormEnabled) {
+          if (
+            !loudnessMetrics ||
+            !loudnessMetrics.normalized ||
+            Math.abs(loudnessMetrics.targetLufs - loudnessTargetLufs) > 0.2
+          ) {
+            const localNorm = normalizeWavAudioBase64(result.audioBase64, {
+              targetLufs: loudnessTargetLufs,
+            });
+            finalAudioBase64 = localNorm.audioBase64;
+            loudnessMetrics = localNorm.metrics;
+          }
+        } else if (!loudnessMetrics) {
+          loudnessMetrics = measureWavLoudnessBase64(
+            result.audioBase64,
+            loudnessTargetLufs
+          );
+        }
+
+        const exactSeconds = getWavDurationSeconds(finalAudioBase64);
+        // Cache normalized chapter WAV in IndexedDB for seamless resume across page reloads
+        saveSegmentAudio(briefingObj.id, segmentId, finalAudioBase64);
         const updated: AudioBriefing = {
           ...briefingObj,
           segments: briefingObj.segments.map((s) =>
             s.id === segmentId
               ? {
                   ...s,
-                  audioBase64: result.audioBase64,
+                  audioBase64: finalAudioBase64,
                   audioDurationSeconds: exactSeconds > 0 ? exactSeconds : s.estimatedSeconds,
                   audioStale: false,
+                  loudnessLufs: loudnessMetrics?.outputLufs,
+                  gainAppliedDb: loudnessMetrics?.gainAppliedDb,
+                  peakDbfs: loudnessMetrics?.peakDbfs,
                 }
               : s
           ),
@@ -1994,7 +2140,79 @@ export default function App() {
         setSynthesizingSegmentId(null);
       }
     },
-    [commitBriefingUpdate]
+    [commitBriefingUpdate, loudnessNormEnabled, loudnessTargetLufs]
+  );
+
+  const handleToggleLoudnessNorm = useCallback(() => {
+    setLoudnessNormEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('dispatch_loudness_norm_enabled', String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
+
+  const handleChangeLoudnessTarget = useCallback(
+    (target: LoudnessTargetPreset) => {
+      setLoudnessTargetLufs(target);
+      try {
+        localStorage.setItem('dispatch_loudness_target_lufs', String(target));
+      } catch {
+        // ignore storage errors
+      }
+    },
+    []
+  );
+
+  // Normalize already-recorded chapters in place without re-synthesizing via Gemini TTS
+  const handleNormalizeRecordedChapters = useCallback(
+    (overrideTargetLufs?: LoudnessTargetPreset) => {
+      if (!activeBriefing) return;
+      const effectiveTarget = overrideTargetLufs ?? loudnessTargetLufs;
+      let changedCount = 0;
+
+      const nextSegments = activeBriefing.segments.map((seg) => {
+        if (!seg.audioBase64 || seg.audioBase64 === 'hosted') return seg;
+        const norm = normalizeWavAudioBase64(seg.audioBase64, {
+          targetLufs: effectiveTarget,
+        });
+        saveSegmentAudio(activeBriefing.id, seg.id, norm.audioBase64);
+        changedCount++;
+        return {
+          ...seg,
+          audioBase64: norm.audioBase64,
+          loudnessLufs: norm.metrics.outputLufs,
+          gainAppliedDb: norm.metrics.gainAppliedDb,
+          peakDbfs: norm.metrics.peakDbfs,
+        };
+      });
+
+      if (changedCount === 0) return;
+
+      const updated: AudioBriefing = {
+        ...activeBriefing,
+        segments: nextSegments,
+      };
+      commitBriefingUpdate(updated);
+
+      // Refresh currently loaded <audio> element seamlessly at the current playhead
+      if (updated.segments[activeSegmentIndex]?.audioBase64) {
+        const liveSeek = audioRef.current?.currentTime ?? currentTime;
+        const wasPlaying = Boolean(audioRef.current && !audioRef.current.paused);
+        loadAndPlaySegment(updated, activeSegmentIndex, wasPlaying, liveSeek);
+      }
+    },
+    [
+      activeBriefing,
+      activeSegmentIndex,
+      commitBriefingUpdate,
+      currentTime,
+      loadAndPlaySegment,
+      loudnessTargetLufs,
+    ]
   );
 
   // Synthesize all unsynthesized or stale chapters sequentially so playback starts quickly
@@ -2185,6 +2403,75 @@ export default function App() {
       commitBriefingUpdate(updated);
     },
     [activeBriefing, commitBriefingUpdate]
+  );
+
+  // Reorder podcast chapters via drag-and-drop or keyboard/step controls while preserving live playback continuity
+  const handleReorderSegments = useCallback(
+    (fromIndex: number, toIndex: number) => {
+      if (!activeBriefing) return;
+      const total = activeBriefing.segments.length;
+      if (
+        fromIndex < 0 ||
+        fromIndex >= total ||
+        toIndex < 0 ||
+        toIndex >= total ||
+        fromIndex === toIndex
+      ) {
+        return;
+      }
+
+      const currentActiveSegId = activeBriefing.segments[activeSegmentIndex]?.id;
+      const nextSegments = [...activeBriefing.segments];
+      const [moved] = nextSegments.splice(fromIndex, 1);
+      nextSegments.splice(toIndex, 0, moved);
+
+      const nextActiveIdx = currentActiveSegId
+        ? Math.max(0, nextSegments.findIndex((s) => s.id === currentActiveSegId))
+        : 0;
+
+      const updated: AudioBriefing = {
+        ...activeBriefing,
+        segments: nextSegments,
+      };
+
+      if (nextActiveIdx !== activeSegmentIndex) {
+        setActiveSegmentIndex(nextActiveIdx);
+        const existingPos = playbackPositionsRef.current[updated.id];
+        const nextPos: PlaybackPosition = {
+          briefingId: updated.id,
+          segmentIndex: nextActiveIdx,
+          currentTime: audioRef.current?.currentTime ?? currentTime,
+          duration: audioRef.current?.duration || duration,
+          playbackRate,
+          updatedAt: new Date().toISOString(),
+          completed: existingPos?.completed ?? false,
+          maxListenedSeconds: existingPos?.maxListenedSeconds ?? 0,
+        };
+        setPlaybackPositions((prev) => {
+          const next = { ...prev, [updated.id]: nextPos };
+          try {
+            localStorage.setItem(STORAGE_PLAYBACK_KEY, JSON.stringify(next));
+          } catch {
+            // Ignore storage quota errors
+          }
+          return next;
+        });
+        playbackPositionsRef.current = {
+          ...playbackPositionsRef.current,
+          [updated.id]: nextPos,
+        };
+      }
+
+      commitBriefingUpdate(updated);
+    },
+    [
+      activeBriefing,
+      activeSegmentIndex,
+      commitBriefingUpdate,
+      currentTime,
+      duration,
+      playbackRate,
+    ]
   );
 
   // Refine script via Gemini intelligence
@@ -2556,15 +2843,17 @@ export default function App() {
     sleepTimerMode,
   ]);
 
-  // Build stitched WAV Blob from recorded briefing chapters
+  // Build stitched WAV Blob from recorded briefing chapters (enforcing uniform loudness when enabled)
   const handleBuildStitchedWavBlob = useCallback((): Blob | null => {
     if (!activeBriefing) return null;
     const clips = activeBriefing.segments
       .map((s) => s.audioBase64)
       .filter((b): b is string => Boolean(b));
     if (clips.length === 0) return null;
-    return stitchWavBase64Clips(clips);
-  }, [activeBriefing]);
+    return stitchWavBase64Clips(clips, {
+      normalizeTargetLufs: loudnessNormEnabled ? loudnessTargetLufs : null,
+    });
+  }, [activeBriefing, loudnessNormEnabled, loudnessTargetLufs]);
 
   // Download full stitched WAV episode
   const handleDownloadFullWav = useCallback(() => {
@@ -2833,12 +3122,15 @@ export default function App() {
             const cached = audioMap[seg.id];
             if (!cached) return seg;
             const exactSeconds = getWavDurationSeconds(cached);
+            const measured = measureWavLoudnessBase64(cached, loudnessTargetLufs);
             return {
               ...seg,
               audioBase64: cached,
               audioDurationSeconds:
                 exactSeconds > 0 ? exactSeconds : seg.audioDurationSeconds,
               audioStale: false,
+              loudnessLufs: measured?.outputLufs ?? seg.loudnessLufs,
+              peakDbfs: measured?.peakDbfs ?? seg.peakDbfs,
             };
           }),
         };
@@ -3622,6 +3914,7 @@ export default function App() {
             isUploading={isIngesting}
             uploadStatus={uploadStatus}
             isTagging={isTagging}
+            taggingQueueSnapshot={taggingQueueSnapshot}
             isRefreshingArticles={isRefreshingArticles}
             refreshArticlesStatus={refreshArticlesStatus}
             queueTab={deskQueueTab}
@@ -3729,6 +4022,7 @@ export default function App() {
                 }}
                 onUpdateSegmentLines={handleUpdateSegmentLines}
                 onUpdateSegmentCoHostVoice={handleUpdateSegmentCoHostVoice}
+                onReorderSegments={handleReorderSegments}
                 onRefineScript={handleRefineScript}
                 onSelectCitation={handleSelectCitation}
                 onDownloadFullWav={handleDownloadFullWav}
@@ -3739,6 +4033,11 @@ export default function App() {
                   setDriveModalTab('export');
                   setDriveModalOpen(true);
                 }}
+                loudnessNormEnabled={loudnessNormEnabled}
+                loudnessTargetLufs={loudnessTargetLufs}
+                onToggleLoudnessNorm={handleToggleLoudnessNorm}
+                onChangeLoudnessTarget={handleChangeLoudnessTarget}
+                onNormalizeRecordedChapters={handleNormalizeRecordedChapters}
                 onSendTakeawaysToTasks={(indices) => {
                   setStagedTaskIndices(indices ?? []);
                   setTasksDrawerOpen(true);

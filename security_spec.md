@@ -1,7 +1,7 @@
 # Firestore Security Specification — Dispatch Studio, Workspace Sync & Auth Governance
 
 ## 1. Data Invariants
-1. **Default-Deny Global Gate**: All paths outside `/userProfiles/{userId}`, `/siteMockups/{mockupId}`, `/siteMockups/{mockupId}/mediaAssets/{assetId}`, `/publicShareLinks/{shareId}`, `/feedAlertAcknowledgments/{ackId}`, `/notebookSources/{docId}`, `/briefingArchives/{docId}`, and `/workspaceLinks/{docId}` are unconditionally denied.
+1. **Default-Deny Global Gate**: All paths outside `/userProfiles/{userId}`, `/siteMockups/{mockupId}`, `/siteMockups/{mockupId}/mediaAssets/{assetId}`, `/publicShareLinks/{shareId}`, `/feedAlertAcknowledgments/{ackId}`, `/notebookSources/{docId}`, `/briefingArchives/{docId}`, `/workspaceLinks/{docId}`, and `/aiDeskTranscriptDrafts/{draftId}` are unconditionally denied.
 2. **Verified Principal Identity & Studio Admin Lookup**: Only a caller with `request.auth != null`, `request.auth.token.email_verified == true`, and `request.auth.token.email == 'mcollier2188@gmail.com'` satisfies `isPrincipalOwner()`. Single-document admin governance checks (`isVerifiedStudioAdmin()`) verify an active `/userProfiles/$(request.auth.uid)` record with `role == 'admin'` and are never placed inside `allow list`.
 3. **PII Isolation & Corrupted-Link Inspection on `/userProfiles/{userId}`**: User profiles contain PII (`email`, `displayName`, `photoUrl`). Single-document `get` and `list` queries are strictly restricted to `isPrincipalOwner()` or `'uid' in resource.data && resource.data.uid == request.auth.uid`. Blanket `isSignedIn()` reads are forbidden.
 4. **Privilege Escalation & Self-Assigned Role Prevention**:
@@ -26,6 +26,9 @@
 11. **Owner-Scoped Google Workspace Links (`/workspaceLinks/{docId}`)**:
     - Strict schema validation (`isValidWorkspaceLink(incoming(), docId)`) enforces exact `hasAll` / `hasOnly` keys, `linkId == docId`, `ownerId == request.auth.uid`, and `kind in ['drive_source', 'google_doc_export', 'drive_wav_export', 'google_task']`. No OAuth tokens are ever stored in Firestore.
     - `list` queries enforce `'ownerId' in existing() && existing().ownerId == request.auth.uid` with zero `get()`/`exists()` lookups; `update` locks `linkId`, `ownerId`, `kind`, `externalId`, and `createdAt`.
+12. **Owner-Scoped AI Desk 30-Second Transcript Drafts (`/aiDeskTranscriptDrafts/{draftId}`)**:
+    - Strict schema validation (`isValidAiDeskTranscriptDraft(incoming(), draftId)`) enforces exact `hasAll` / `hasOnly` keys, `draftId == ('drf_' + request.auth.uid + '_' + data.surface)`, `ownerId == request.auth.uid`, `surface in ['transcribe', 'live']`, bounded `title` (`1..200`), bounded `transcriptText` (`0..50000`), bounded `turns` (`<= 200` structured `{ id, role, text, timestamp }` maps with `text` `1..4000` chars), bounded `voiceName` (`0..64`), and `durationSeconds` (`0..14400`).
+    - Single-document `get` permits owner/Principal Owner reads and deterministic null-resource bootstrap checks (`^drf_${uid}_(transcribe|live)$`); `list` queries enforce `'ownerId' in existing() && existing().ownerId == request.auth.uid` with zero `get()`/`exists()` lookups; `update` locks `draftId`, `ownerId`, `surface`, and `createdAt`, allowing only `['title', 'transcriptText', 'turns', 'voiceName', 'durationSeconds', 'clientSavedAtIso', 'updatedAt']` to mutate with `updatedAt == request.time`.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads (Must Return `PERMISSION_DENIED`)
 1. **Self-Assigned Owner on Registration**: Standard user (`alice@example.com`, `email_verified: true`) creates `/userProfiles/uid_alice` with `role: "owner", isOwner: true`.

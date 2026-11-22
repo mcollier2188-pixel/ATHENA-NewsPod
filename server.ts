@@ -30,6 +30,11 @@ import {
   scrubProseString,
   scrubShareValueDeep,
 } from './src/utils/sharePayloadInspector.ts';
+import {
+  DEFAULT_LOUDNESS_TARGET_LUFS,
+  measureWavLoudnessBase64,
+  normalizeWavAudioBase64,
+} from './src/utils/audioNormalization.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1262,7 +1267,7 @@ app.post('/api/articles/ingest', async (req, res) => {
   }
 });
 
-// 1C. Automatically generate context-relevant tags for one or more sources
+// 1C. Automatically generate context-relevant tags for one or more sources (concurrent sub-batching)
 app.post('/api/sources/tag', async (req, res) => {
   try {
     const { sources } = req.body as {
@@ -1280,63 +1285,104 @@ app.post('/api/sources/tag', async (req, res) => {
       return;
     }
 
-    const batch = sources.slice(0, 20);
-    const sourceDigest = batch
-      .map(
-        (s, idx) =>
-          `[${idx + 1}] ID: ${s.id}\nTitle: ${s.title}\nCategory: ${s.category || 'General'}\nExcerpt: ${(s.summary || s.content || '').slice(0, 480)}`
-      )
-      .join('\n\n');
+    // Deduplicate incoming sources and accept up to 60 sources per batch request
+    const seenIds = new Set<string>();
+    const dedupedSources = sources
+      .filter((s) => {
+        if (!s?.id || seenIds.has(s.id)) return false;
+        seenIds.add(s.id);
+        return true;
+      })
+      .slice(0, 60);
 
-    const tagsById: Record<string, string[]> = {};
-    const fallbackById = new Map(batch.map((s) => [s.id, s.category]));
-
-    try {
-      const ai = getGeminiClient();
-      const response = await withTextModelFallback((model) =>
-        ai.models.generateContent({
-          model,
-          contents: `Assign 2 to 3 crisp, context-relevant newsroom tags to each source below.\n\n${sourceDigest}`,
-          config: {
-            systemInstruction:
-              'You are a newsroom taxonomy editor. For each source, return 2 to 3 concise 1-2 word tags such as "Tech", "Economy", "Politics", "Climate", "Energy", "AI", "Policy", "Markets", "Transit", "Health", "Science", "Europe", "World", or "Finance". Prefer standardized short labels so related articles share tags cleanly.',
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                items: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.STRING },
-                      tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    },
-                    required: ['id', 'tags'],
-                  },
-                },
-              },
-              required: ['items'],
-            },
-          },
-        })
-      );
-
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-        items?: Array<{ id?: string; tags?: unknown }>;
-      };
-
-      if (Array.isArray(parsed.items)) {
-        for (const item of parsed.items) {
-          if (!item?.id) continue;
-          tagsById[item.id] = normalizeTags(item.tags, fallbackById.get(item.id));
-        }
-      }
-    } catch {
-      // Fall back to category-derived tags if Gemini is rate-limited
+    const SUB_BATCH_SIZE = 10;
+    const MAX_CONCURRENT_SUB_BATCHES = 3;
+    const subBatches: Array<typeof dedupedSources> = [];
+    for (let i = 0; i < dedupedSources.length; i += SUB_BATCH_SIZE) {
+      subBatches.push(dedupedSources.slice(i, i + SUB_BATCH_SIZE));
     }
 
-    for (const s of batch) {
+    const tagsById: Record<string, string[]> = {};
+    const fallbackById = new Map(dedupedSources.map((s) => [s.id, s.category]));
+
+    let ai: GoogleGenAI | null = null;
+    try {
+      ai = getGeminiClient();
+    } catch {
+      ai = null;
+    }
+
+    if (ai) {
+      let nextSubIdx = 0;
+      const workerCount = Math.min(MAX_CONCURRENT_SUB_BATCHES, subBatches.length);
+      const client = ai;
+
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (nextSubIdx < subBatches.length) {
+            const subBatch = subBatches[nextSubIdx++];
+            const sourceDigest = subBatch
+              .map(
+                (s, idx) =>
+                  `[${idx + 1}] ID: ${s.id}\nTitle: ${s.title}\nCategory: ${s.category || 'General'}\nExcerpt: ${(s.summary || s.content || '').slice(0, 420)}`
+              )
+              .join('\n\n');
+
+            try {
+              const response = await withTextModelFallback((model) =>
+                client.models.generateContent({
+                  model,
+                  contents: `Assign 2 to 3 crisp, context-relevant newsroom tags to each source below.\n\n${sourceDigest}`,
+                  config: {
+                    systemInstruction:
+                      'You are a newsroom taxonomy editor. For each source, return 2 to 3 concise 1-2 word tags such as "Tech", "Economy", "Politics", "Climate", "Energy", "AI", "Policy", "Markets", "Transit", "Health", "Science", "Europe", "World", or "Finance". Prefer standardized short labels so related articles share tags cleanly.',
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                      type: Type.OBJECT,
+                      properties: {
+                        items: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              id: { type: Type.STRING },
+                              tags: {
+                                type: Type.ARRAY,
+                                items: { type: Type.STRING },
+                              },
+                            },
+                            required: ['id', 'tags'],
+                          },
+                        },
+                      },
+                      required: ['items'],
+                    },
+                  },
+                })
+              );
+
+              const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+                items?: Array<{ id?: string; tags?: unknown }>;
+              };
+
+              if (Array.isArray(parsed.items)) {
+                for (const item of parsed.items) {
+                  if (!item?.id) continue;
+                  tagsById[item.id] = normalizeTags(
+                    item.tags,
+                    fallbackById.get(item.id)
+                  );
+                }
+              }
+            } catch {
+              // Fall back to category-derived tags for this sub-batch if Gemini is rate-limited
+            }
+          }
+        })
+      );
+    }
+
+    for (const s of dedupedSources) {
       if (!tagsById[s.id] || tagsById[s.id].length === 0) {
         tagsById[s.id] = normalizeTags([], s.category || 'News');
       }
@@ -1887,6 +1933,8 @@ app.post('/api/tts/synthesize', async (req, res) => {
       coHostVoiceName = 'Puck',
       tone = 'executive',
       voiceTone,
+      normalizeLoudness = true,
+      targetLufs = DEFAULT_LOUDNESS_TARGET_LUFS,
     } = req.body as {
       format?: 'solo' | 'podcast';
       lines?: ScriptLine[];
@@ -1895,7 +1943,14 @@ app.post('/api/tts/synthesize', async (req, res) => {
       coHostVoiceName?: string;
       tone?: string;
       voiceTone?: string;
+      normalizeLoudness?: boolean;
+      targetLufs?: number;
     };
+
+    const resolvedTargetLufs =
+      typeof targetLufs === 'number' && Number.isFinite(targetLufs)
+        ? Math.max(-24, Math.min(-10, targetLufs))
+        : DEFAULT_LOUDNESS_TARGET_LUFS;
 
     const allowedVoices = new Set(['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr']);
     const primaryVoice = allowedVoices.has(voiceName) ? voiceName : 'Kore';
@@ -2053,9 +2108,22 @@ app.post('/api/tts/synthesize', async (req, res) => {
         return;
       }
 
+      if (normalizeLoudness !== false) {
+        const normalized = normalizeWavAudioBase64(inlineData.data, {
+          targetLufs: resolvedTargetLufs,
+        });
+        res.json({
+          audioBase64: normalized.audioBase64,
+          mimeType: 'audio/wav',
+          loudness: normalized.metrics,
+        });
+        return;
+      }
+
       res.json({
         audioBase64: inlineData.data,
         mimeType: inlineData.mimeType || 'audio/wav',
+        loudness: measureWavLoudnessBase64(inlineData.data, resolvedTargetLufs) ?? undefined,
       });
       return;
     }
@@ -2108,9 +2176,22 @@ app.post('/api/tts/synthesize', async (req, res) => {
       return;
     }
 
+    if (normalizeLoudness !== false) {
+      const normalized = normalizeWavAudioBase64(inlineData.data, {
+        targetLufs: resolvedTargetLufs,
+      });
+      res.json({
+        audioBase64: normalized.audioBase64,
+        mimeType: 'audio/wav',
+        loudness: normalized.metrics,
+      });
+      return;
+    }
+
     res.json({
       audioBase64: inlineData.data,
       mimeType: inlineData.mimeType || 'audio/wav',
+      loudness: measureWavLoudnessBase64(inlineData.data, resolvedTargetLufs) ?? undefined,
     });
   } catch (err) {
     const { status, message } = formatApiError(err);

@@ -9,6 +9,7 @@ import {
   setDoc,
   updateDoc,
   where,
+  writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
@@ -369,6 +370,65 @@ export async function upsertNotebookSourceToFirestore(
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function batchUpsertNotebookSourcesToFirestore(
+  ownerId: string,
+  articles: NewsArticle[]
+): Promise<void> {
+  if (!ownerId || articles.length === 0) return;
+  if (articles.length === 1) {
+    await upsertNotebookSourceToFirestore(ownerId, articles[0]);
+    return;
+  }
+
+  // Deduplicate by article ID (last write wins) and commit in chunks <= 200
+  const dedupedMap = new Map<string, NewsArticle>();
+  for (const art of articles) {
+    if (art?.id) dedupedMap.set(art.id, art);
+  }
+  const uniqueArticles = Array.from(dedupedMap.values());
+  const CHUNK_SIZE = 50;
+
+  for (let offset = 0; offset < uniqueArticles.length; offset += CHUNK_SIZE) {
+    const slice = uniqueArticles.slice(offset, offset + CHUNK_SIZE);
+    const firstDocId = buildSourceDocId(ownerId, slice[0].id);
+    const batchPath = `${SOURCES_COLLECTION}/${firstDocId}`;
+
+    try {
+      const entries = await Promise.all(
+        slice.map(async (article) => {
+          const docId = buildSourceDocId(ownerId, article.id);
+          const docRef = doc(db, SOURCES_COLLECTION, docId);
+          const existing = await getDoc(docRef);
+          return { article, docId, docRef, exists: existing.exists() };
+        })
+      );
+
+      const batch = writeBatch(db);
+      for (const { article, docId, docRef, exists } of entries) {
+        const mutable = buildMutableSourceFields(article);
+        if (exists) {
+          batch.update(docRef, {
+            ...mutable,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          batch.set(docRef, {
+            docId,
+            sourceId: clampStr(article.id, 128, 'src-1'),
+            ownerId,
+            ...mutable,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, batchPath);
+    }
   }
 }
 

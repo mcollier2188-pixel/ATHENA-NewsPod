@@ -987,6 +987,237 @@ test('Workspace & Cloud Sync Collections (/notebookSources, /briefingArchives, /
   );
 });
 
+test('AiDeskTranscriptDrafts Security (/aiDeskTranscriptDrafts): 30s auto-save owner isolation, deterministic ID binding, and Red Team payload rejection', () => {
+  assert.match(rulesText, /match \/aiDeskTranscriptDrafts\/\{draftId\}/);
+  assert.match(rulesText, /isValidAiDeskTranscriptDraft\(incoming\(\), draftId\)/);
+  assert.match(rulesText, /isAiDeskTranscriptDraftOwnerSyncAction\(\)/);
+  assert.match(rulesText, /draftId == \('drf_' \+ request\.auth\.uid \+ '_' \+ data\.surface\)/);
+
+  interface TurnItem {
+    id: string;
+    role: string;
+    text: string;
+    timestamp: string;
+    [extraKey: string]: unknown;
+  }
+
+  interface TranscriptDraftPayload {
+    draftId: string;
+    ownerId: string;
+    surface: string;
+    title: string;
+    transcriptText: string;
+    turns: TurnItem[];
+    voiceName: string;
+    durationSeconds: number;
+    clientSavedAtIso: string;
+    createdAt: number;
+    updatedAt: number;
+    [extraKey: string]: unknown;
+  }
+
+  const DRAFT_KEYS = new Set([
+    'draftId',
+    'ownerId',
+    'surface',
+    'title',
+    'transcriptText',
+    'turns',
+    'voiceName',
+    'durationSeconds',
+    'clientSavedAtIso',
+    'createdAt',
+    'updatedAt',
+  ]);
+
+  const TURN_KEYS = new Set(['id', 'role', 'text', 'timestamp']);
+
+  const isValidTurn = (t: TurnItem): boolean => {
+    const keys = Object.keys(t);
+    if (keys.length !== TURN_KEYS.size || !keys.every((k) => TURN_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      typeof t.id === 'string' &&
+      t.id.length >= 1 &&
+      t.id.length <= 128 &&
+      ['user', 'model'].includes(t.role) &&
+      typeof t.text === 'string' &&
+      t.text.length >= 1 &&
+      t.text.length <= 4000 &&
+      typeof t.timestamp === 'string' &&
+      t.timestamp.length >= 1 &&
+      t.timestamp.length <= 64
+    );
+  };
+
+  const isValidDraft = (
+    auth: AuthToken,
+    data: TranscriptDraftPayload,
+    draftId: string
+  ): boolean => {
+    const keys = Object.keys(data);
+    if (keys.length !== DRAFT_KEYS.size || !keys.every((k) => DRAFT_KEYS.has(k))) {
+      return false;
+    }
+    return (
+      isValidId(data.draftId) &&
+      data.draftId === draftId &&
+      isValidId(data.ownerId) &&
+      data.ownerId === auth.uid &&
+      ['transcribe', 'live'].includes(data.surface) &&
+      draftId === `drf_${auth.uid}_${data.surface}` &&
+      data.title.length >= 1 &&
+      data.title.length <= 200 &&
+      data.transcriptText.length <= 50000 &&
+      Array.isArray(data.turns) &&
+      data.turns.length <= 200 &&
+      (data.turns.length === 0 || isValidTurn(data.turns[0])) &&
+      data.voiceName.length <= 64 &&
+      typeof data.durationSeconds === 'number' &&
+      data.durationSeconds >= 0 &&
+      data.durationSeconds <= 14400 &&
+      data.clientSavedAtIso.length >= 1 &&
+      data.clientSavedAtIso.length <= 64 &&
+      typeof data.createdAt === 'number' &&
+      typeof data.updatedAt === 'number'
+    );
+  };
+
+  const evaluateDraftGet = (
+    auth: AuthToken | null,
+    draftId: string,
+    docOwnerId: string | null
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(draftId)) return false;
+    if (docOwnerId !== null) {
+      return docOwnerId === auth.uid || isPrincipalOwner(auth);
+    }
+    const ownBootstrapRegex = new RegExp(`^drf_${auth.uid}_(transcribe|live)$`);
+    return ownBootstrapRegex.test(draftId) || isPrincipalOwner(auth);
+  };
+
+  const evaluateDraftCreate = (
+    auth: AuthToken | null,
+    draftId: string,
+    incoming: TranscriptDraftPayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(draftId)) return false;
+    if (!isValidDraft(auth, incoming, draftId)) return false;
+    return incoming.createdAt === REQ_TIME && incoming.updatedAt === REQ_TIME;
+  };
+
+  const evaluateDraftUpdate = (
+    auth: AuthToken | null,
+    draftId: string,
+    existing: TranscriptDraftPayload,
+    incoming: TranscriptDraftPayload
+  ): boolean => {
+    if (!auth || !auth.email_verified || !isValidId(draftId)) return false;
+    if (!isValidDraft(auth, incoming, draftId)) return false;
+    const affected = Object.keys(incoming).filter((k) => incoming[k] !== existing[k]);
+    const allowed = new Set([
+      'title',
+      'transcriptText',
+      'turns',
+      'voiceName',
+      'durationSeconds',
+      'clientSavedAtIso',
+      'updatedAt',
+    ]);
+    return (
+      existing.ownerId === auth.uid &&
+      incoming.draftId === existing.draftId &&
+      incoming.ownerId === existing.ownerId &&
+      incoming.surface === existing.surface &&
+      incoming.createdAt === existing.createdAt &&
+      incoming.updatedAt === REQ_TIME &&
+      affected.every((k) => allowed.has(k))
+    );
+  };
+
+  const aliceTranscribeId = 'drf_uid_alice_transcribe';
+  const baseDraft: TranscriptDraftPayload = {
+    draftId: aliceTranscribeId,
+    ownerId: 'uid_alice',
+    surface: 'transcribe',
+    title: 'Field Interview · City Council',
+    transcriptText: 'Mayor confirmed phase two transit funding begins in Q2.',
+    turns: [],
+    voiceName: '',
+    durationSeconds: 42,
+    clientSavedAtIso: '2026-11-21T21:00:00.000Z',
+    createdAt: REQ_TIME,
+    updatedAt: REQ_TIME,
+  };
+
+  // Null-resource bootstrap check allowed for own deterministic draft ID, denied for other users
+  assert.equal(evaluateDraftGet(aliceAuth, aliceTranscribeId, null), true);
+  assert.equal(evaluateDraftGet(aliceAuth, 'drf_uid_bob_transcribe', null), false);
+
+  // Positive create & 30-second auto-save update succeed
+  assert.equal(evaluateDraftCreate(aliceAuth, aliceTranscribeId, baseDraft), true);
+  const existingDraft = {
+    ...baseDraft,
+    createdAt: REQ_TIME - 30_000,
+    updatedAt: REQ_TIME - 30_000,
+  };
+  assert.equal(
+    evaluateDraftUpdate(aliceAuth, aliceTranscribeId, existingDraft, {
+      ...existingDraft,
+      transcriptText:
+        'Mayor confirmed phase two transit funding begins in Q2 with full council backing.',
+      clientSavedAtIso: '2026-11-21T21:00:30.000Z',
+      updatedAt: REQ_TIME,
+    }),
+    true
+  );
+
+  // Red Team: cross-user ownerId spoof or mismatched surface/draftId -> PERMISSION_DENIED
+  assert.equal(
+    evaluateDraftCreate(aliceAuth, 'drf_uid_bob_transcribe', {
+      ...baseDraft,
+      draftId: 'drf_uid_bob_transcribe',
+      ownerId: 'uid_bob',
+    }),
+    false
+  );
+  assert.equal(
+    evaluateDraftCreate(aliceAuth, aliceTranscribeId, {
+      ...baseDraft,
+      surface: 'live',
+    }),
+    false
+  );
+
+  // Red Team: shadow field injection or oversized transcriptText (> 50,000 chars) -> PERMISSION_DENIED
+  assert.equal(
+    evaluateDraftCreate(aliceAuth, aliceTranscribeId, {
+      ...baseDraft,
+      isVerified: true,
+    }),
+    false
+  );
+  assert.equal(
+    evaluateDraftCreate(aliceAuth, aliceTranscribeId, {
+      ...baseDraft,
+      transcriptText: 'x'.repeat(50_001),
+    }),
+    false
+  );
+
+  // Red Team: mutating immutable surface or backdating createdAt on update -> PERMISSION_DENIED
+  assert.equal(
+    evaluateDraftUpdate(aliceAuth, aliceTranscribeId, existingDraft, {
+      ...existingDraft,
+      createdAt: REQ_TIME,
+      updatedAt: REQ_TIME,
+    }),
+    false
+  );
+});
+
+
 
 
 
